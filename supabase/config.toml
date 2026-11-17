@@ -1,0 +1,7 @@
+# Every function deploys with verify_jwt = true: the gateway validates the
+# caller's JWT before the handler runs, and withAuthorizedCaller (_shared/serve.ts)
+# re-checks it with a full GoTrue getUser() round trip, so each function stands
+# on its own even if the flag is ever lost on a redeploy.
+#
+# Deploys happen via scripts/deploy-fn.mjs, never by hand.
+# See: https://supabase.com/docs/guides/functions/auth-headers
