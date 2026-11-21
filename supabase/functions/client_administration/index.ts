@@ -16,6 +16,7 @@ import { selectAllRows, selectForIds } from "../_shared/paging.ts";
 import { listEntities, saveEntity } from "../_shared/legal-entities.ts";
 import { effectiveCountry, loadOrgLocale } from "../_shared/organisation-locale.ts";
 import { appToday } from "../_shared/app-date.ts";
+import { applyFolderTemplate } from "../_shared/folder-template-apply.ts";
 import { retentionRefusal } from "../_shared/file-approval.ts";
 import {
   type DocumentEntityConfig,
@@ -206,6 +207,8 @@ async function handleCreateClient(
     await ctx.serviceClient.from("clients").delete().eq("id", clientInsert.id);
     return jsonResponse({ error: "Unable to create the client's legal entity." }, request, 500);
   }
+
+  await applyFolderTemplate(ctx.serviceClient, "client", String(clientInsert.id), ctx.callerId);
 
   // Return the id: a caller that opened this drawer to fill a picker needs to
   // know which client was made.

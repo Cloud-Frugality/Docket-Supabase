@@ -138,3 +138,17 @@ export function parseRetentionYears(raw: unknown): { ok: true; years: number | n
   }
   return { ok: true, years };
 }
+
+/**
+ * The approval rules of a client or engagement not saved yet: what they will
+ * be scoped as, and whether the caller may set them. An engagement names its
+ * team and needs the caller in it (or a global admin); a client has no team.
+ * Either way the caller must be able to write that kind of record.
+ */
+export function draftRuleRight(input: { teamId: string | null; writeLevel: number; inTeam: boolean; globalAdmin: boolean }): {
+  scope: "client" | "engagement";
+  allowed: boolean;
+} {
+  const scope = input.teamId ? "engagement" : "client";
+  return { scope, allowed: input.writeLevel > 0 && (scope === "client" || input.globalAdmin || input.inTeam) };
+}

@@ -11,8 +11,10 @@ import { deleteEntity, isLiveEntityOf, listEntities, saveEntity } from "../_shar
 import { effectiveCountry, effectiveCurrency, loadOrgLocale } from "../_shared/organisation-locale.ts";
 import { TERM_KEYS, cleanTerm } from "../_shared/terms.ts";
 import { idList } from "../_shared/list-links.ts";
+import { parseTemplateFolders } from "../_shared/folder-templates.ts";
+import { parseBinDays } from "../_shared/document-rules.ts";
 import { allowedDocumentTypes } from "../_shared/document-categories.ts";
-import { parseGroupName, parseRetentionYears, RULE_SCOPES, type RuleScope } from "../_shared/file-approval.ts";
+import { draftRuleRight, parseGroupName, parseRetentionYears, RULE_SCOPES, type RuleScope } from "../_shared/file-approval.ts";
 import {
   canManageMembers,
   cleanTeamDetails,
@@ -47,7 +49,7 @@ async function roleInTeam(serviceClient: ServiceClient, teamId: string, userId: 
 async function theOrganisation(serviceClient: ServiceClient) {
   return await serviceClient
     .from("organisations")
-    .select("id, name, default_country_code, lock_country, default_currency, lock_currency, time_zone, date_format, clients_enabled, engagements_enabled, allow_self_approval, client_term, clients_term, engagement_term, engagements_term")
+    .select("id, name, default_country_code, lock_country, default_currency, lock_currency, time_zone, date_format, clients_enabled, engagements_enabled, allow_self_approval, bin_retention_days, client_term, clients_term, engagement_term, engagements_term")
     .order("created_at")
     .limit(1)
     .single();
@@ -99,6 +101,16 @@ Deno.serve((request) =>
       canRead: read >= LEVEL_ALL || (read > 0 && inTeam),
       canEdit: write > 0 && inTeam,
     };
+  };
+  // A client or engagement not saved yet: no rules of its own, but the groups,
+  // categories and fallbacks it will have once it is.
+  const draftRuleTarget = async (teamId: string | null, clientId: string | null) => {
+    if ((teamId && !isUuid(teamId)) || (clientId && !isUuid(clientId))) return jsonResponse({ error: "Invalid record." }, request, 400);
+    // An engagement names its team; a client has none.
+    const write = await callerLevel(serviceClient, callerId, teamId ? "Engagements" : "Clients", "write");
+    const inTeam = !!teamId && !globalAdmin && !!(await roleInTeam(serviceClient, teamId, callerId));
+    const { scope, allowed } = draftRuleRight({ teamId, writeLevel: write, inTeam, globalAdmin });
+    return { scope: scope as RuleScope, id: null, teamId, clientId, canRead: allowed, canEdit: allowed };
   };
   const RULE_COLUMN: Record<RuleScope, string> = { team: "team_id", client: "client_id", engagement: "engagement_id" };
 
@@ -277,6 +289,24 @@ Deno.serve((request) =>
       }
     }
 
+    // The folders new clients and engagements start with, for Settings.
+    if (resource === "folder_templates") {
+      if (!globalAdmin) return jsonResponse({ error: "Only a global admin can read the folder templates." }, request, 403);
+      const { data, error } = await selectAllRows(() =>
+        serviceClient.from("folder_templates").select("id, kind, team_id, engagement_type_id, folders").order("id")
+      );
+      if (error) return internalError(request, error, "folder templates");
+      return jsonResponse({
+        templates: data.map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          teamId: t.team_id ?? null,
+          engagementTypeId: t.engagement_type_id ?? null,
+          folders: Array.isArray(t.folders) ? t.folders : [],
+        })),
+      }, request);
+    }
+
     // Approver groups: the organisation's, and one team's when a team is
     // named. Every signed-in user reads them, since the rules name them.
     if (resource === "approver_groups") {
@@ -316,15 +346,17 @@ Deno.serve((request) =>
     // One team's, client's or engagement's approval rules, with the groups
     // and categories a rule can name. An engagement also gets the rules it
     // falls back to: its client's, then its team's.
-    if (resource === "approval_rules") {
-      const target = await ruleTarget(url.searchParams.get("scope"), url.searchParams.get("id"));
+    if (resource === "approval_rules" || resource === "approval_rule_options") {
+      const target = resource === "approval_rules"
+        ? await ruleTarget(url.searchParams.get("scope"), url.searchParams.get("id"))
+        : await draftRuleTarget(url.searchParams.get("teamId"), url.searchParams.get("clientId"));
       if (target instanceof Response) return target;
       if (!target.canRead) return jsonResponse({ error: "You don't have permission to read these approval rules." }, request, 403);
       const rulesOf = (scope: RuleScope, id: string) =>
         selectAllRows(() => serviceClient.from("approval_rules").select("id, category_id, group_id").eq(RULE_COLUMN[scope], id).order("id"));
       const none = Promise.resolve({ data: [] as Record<string, unknown>[], error: null });
       const [own, fromClient, fromTeam, groups, categories] = await Promise.all([
-        rulesOf(target.scope, target.id),
+        target.id ? rulesOf(target.scope, target.id) : none,
         target.scope === "engagement" && target.clientId ? rulesOf("client", target.clientId) : none,
         target.scope === "engagement" && target.teamId ? rulesOf("team", target.teamId) : none,
         selectAllRows(() => {
@@ -435,6 +467,7 @@ Deno.serve((request) =>
         engagementsEnabled: org.engagements_enabled !== false,
         // On: someone may approve a document they wrote.
         allowSelfApproval: org.allow_self_approval === true,
+        binRetentionDays: typeof org.bin_retention_days === "number" ? org.bin_retention_days : null,
         // What the organisation calls a client and an engagement.
         terms: { client: org.client_term, clients: org.clients_term, engagement: org.engagement_term, engagements: org.engagements_term },
       },
@@ -667,6 +700,11 @@ Deno.serve((request) =>
     const engagementsEnabled =
       clientsEnabled && (typeof payload.engagementsEnabled === "boolean" ? payload.engagementsEnabled : org.engagements_enabled !== false);
     const allowSelfApproval = typeof payload.allowSelfApproval === "boolean" ? payload.allowSelfApproval : org.allow_self_approval === true;
+    // Kept unless sent; null switches the automatic delete off.
+    const binDays = payload.binRetentionDays === undefined
+      ? { ok: true as const, days: typeof org.bin_retention_days === "number" ? org.bin_retention_days : null }
+      : parseBinDays(payload.binRetentionDays);
+    if (!binDays.ok) return jsonResponse({ error: binDays.error }, request, 400);
     // Its own words for a client and an engagement, each kept unless sent.
     const sent = (payload.terms && typeof payload.terms === "object" ? payload.terms : {}) as Record<string, unknown>;
     const terms: Record<string, string> = {};
@@ -686,6 +724,7 @@ Deno.serve((request) =>
         clients_enabled: clientsEnabled,
         engagements_enabled: engagementsEnabled,
         allow_self_approval: allowSelfApproval,
+        bin_retention_days: binDays.days,
         updated_at: new Date().toISOString(),
         updated_by: callerId,
       })
@@ -896,6 +935,9 @@ Deno.serve((request) =>
     const typeIds = idList(payload.engagementTypeIds);
     const unitIds = idList(payload.businessUnitIds);
     if (!typeIds || !unitIds) return jsonResponse({ error: "Engagement types and business units must be lists." }, request, 400);
+    // Years an approved file is kept. Not sent means unchanged.
+    const retention = "retentionYears" in payload ? parseRetentionYears(payload.retentionYears) : null;
+    if (retention && !retention.ok) return jsonResponse({ error: retention.error }, request, 400);
     // Saved with the category; one that has since gone refuses the lot.
     const saveLinks = async (id: string): Promise<Response | null> => {
       const { error } = await serviceClient.rpc("replace_document_category_links", { p_category_id: id, p_type_ids: typeIds, p_unit_ids: unitIds });
@@ -919,6 +961,10 @@ Deno.serve((request) =>
       });
       if (error) return isUniqueViolation(error) ? duplicate() : internalError(request, error, "category update");
       if (found !== true) return jsonResponse({ error: "Category not found." }, request, 404);
+      if (retention?.ok) {
+        const { error: keptError } = await serviceClient.from("document_categories").update({ retention_years: retention.years }).eq("id", categoryId);
+        if (keptError) return internalError(request, keptError, "category retention");
+      }
       return (await saveLinks(categoryId)) ?? jsonResponse({ message: "Category saved." }, request);
     }
     const { data: org, error: orgErr } = await serviceClient.from("organisations").select("id").order("created_at").limit(1).single();
@@ -927,7 +973,7 @@ Deno.serve((request) =>
       .from("document_categories").select("sort_order").order("sort_order", { ascending: false }).limit(1).maybeSingle();
     const { data, error } = await serviceClient
       .from("document_categories")
-      .insert({ organisation_id: org.id, name: details.name, code, is_binding: payload.isBinding === true, sort_order: Number(last?.sort_order ?? 0) + 1, created_by: callerId })
+      .insert({ organisation_id: org.id, name: details.name, code, is_binding: payload.isBinding === true, retention_years: retention?.ok ? retention.years : null, sort_order: Number(last?.sort_order ?? 0) + 1, created_by: callerId })
       .select("id")
       .single();
     if (error) return isUniqueViolation(error) ? duplicate() : internalError(request, error, "category insert");
@@ -950,27 +996,6 @@ Deno.serve((request) =>
     const { error } = await serviceClient.from("document_categories").delete().eq("id", categoryId);
     if (error) return internalError(request, error, "category delete");
     return jsonResponse({ message: "Category deleted." }, request);
-  };
-
-  // How many years an approved file of each category is kept; blank for none.
-  const saveCategoryRetention = async (): Promise<Response> => {
-    if (!globalAdmin) return jsonResponse({ error: GLOBAL_ONLY }, request, 403);
-    const sent = Array.isArray(payload.retention) ? payload.retention as Record<string, unknown>[] : [];
-    const changes: { id: string; years: number | null }[] = [];
-    for (const entry of sent) {
-      if (!isUuid(entry?.categoryId)) return jsonResponse({ error: "Invalid category id." }, request, 400);
-      const parsed = parseRetentionYears(entry.years);
-      if (!parsed.ok) return jsonResponse({ error: parsed.error }, request, 400);
-      changes.push({ id: entry.categoryId as string, years: parsed.years });
-    }
-    for (const change of changes) {
-      const { error } = await serviceClient
-        .from("document_categories")
-        .update({ retention_years: change.years, updated_at: new Date().toISOString(), updated_by: callerId })
-        .eq("id", change.id);
-      if (error) return internalError(request, error, "category retention");
-    }
-    return jsonResponse({ message: "Retention saved." }, request);
   };
 
   // Approver groups: the organisation's are kept by global admins, a team's
@@ -1060,7 +1085,56 @@ Deno.serve((request) =>
     return jsonResponse({ message: groupId ? "Rule saved." : "Rule removed." }, request);
   };
 
+  // One template for each thing it can be for: clients, or engagements of a
+  // team, a type, both or neither. What it is for is fixed once it is made.
+  const TEMPLATES_ONLY = "Only a global admin can change the folder templates.";
+  const saveFolderTemplate = async (): Promise<Response> => {
+    if (!globalAdmin) return jsonResponse({ error: TEMPLATES_ONLY }, request, 403);
+    const parsed = parseTemplateFolders(payload.folders);
+    if (!parsed.ok) return jsonResponse({ error: parsed.error }, request, 400);
+    const stamp = { folders: parsed.folders, updated_by: callerId, updated_at: new Date().toISOString() };
+    if (payload.templateId !== undefined && payload.templateId !== null) {
+      if (!isUuid(payload.templateId)) return jsonResponse({ error: "Invalid template id." }, request, 400);
+      const { data, error } = await serviceClient.from("folder_templates").update(stamp).eq("id", payload.templateId).select("id").maybeSingle();
+      if (error) return internalError(request, error, "folder template update");
+      if (!data) return jsonResponse({ error: "Template not found." }, request, 404);
+      return jsonResponse({ message: "Template saved.", id: data.id }, request);
+    }
+    const kind = payload.kind;
+    if (kind !== "client" && kind !== "engagement") return jsonResponse({ error: "A template is for clients or for engagements." }, request, 400);
+    const optionalId = (value: unknown) => (value === undefined || value === null || value === "" ? null : value);
+    const teamId = optionalId(payload.teamId);
+    const engagementTypeId = optionalId(payload.engagementTypeId);
+    if ((teamId !== null && !isUuid(teamId)) || (engagementTypeId !== null && !isUuid(engagementTypeId))) {
+      return jsonResponse({ error: "Invalid team or engagement type." }, request, 400);
+    }
+    if (kind === "client" && (teamId || engagementTypeId)) {
+      return jsonResponse({ error: "A client template has no team or engagement type." }, request, 400);
+    }
+    const { data, error } = await serviceClient
+      .from("folder_templates")
+      .insert({ kind, team_id: teamId, engagement_type_id: engagementTypeId, ...stamp })
+      .select("id")
+      .single();
+    if (error) {
+      if (isUniqueViolation(error)) return jsonResponse({ error: "There is already a template for that. Change that one instead." }, request, 409);
+      if (error.code === "23503") return jsonResponse({ error: "That team or engagement type no longer exists." }, request, 400);
+      return internalError(request, error, "folder template insert");
+    }
+    return jsonResponse({ message: "Template saved.", id: data.id }, request);
+  };
+
+  const deleteFolderTemplate = async (): Promise<Response> => {
+    if (!globalAdmin) return jsonResponse({ error: TEMPLATES_ONLY }, request, 403);
+    if (!isUuid(payload.templateId)) return jsonResponse({ error: "Invalid template id." }, request, 400);
+    const { error } = await serviceClient.from("folder_templates").delete().eq("id", payload.templateId);
+    if (error) return internalError(request, error, "folder template delete");
+    return jsonResponse({ message: "Template deleted." }, request);
+  };
+
   const MUTATIONS: Record<string, () => Promise<Response>> = {
+    save_folder_template: saveFolderTemplate,
+    delete_folder_template: deleteFolderTemplate,
     save_approver_group: saveApproverGroup,
     delete_approver_group: deleteApproverGroup,
     set_approval_rule: setApprovalRule,
@@ -1078,7 +1152,6 @@ Deno.serve((request) =>
     delete_engagement_type: deleteEngagementType,
     save_document_category: saveDocumentCategory,
     delete_document_category: deleteDocumentCategory,
-    save_category_retention: saveCategoryRetention,
     save_our_entity: saveOurEntity,
     delete_our_entity: deleteOurEntity,
     save_team_settings: saveTeamSettings,

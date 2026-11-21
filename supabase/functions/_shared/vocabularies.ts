@@ -121,8 +121,6 @@ export const DATE_FORMATS = ["dd MMM yyyy", "dd/MM/yyyy", "MM/dd/yyyy", "yyyy-MM
 // (you can't land where you can't look). Keep in step with LANDING_PAGES in
 // src/lib/constants.ts.
 export const LANDING_ENTITY: Record<string, string> = {
-  "/clients": "Clients",
-  "/engagements": "Engagements",
   "/documents": "Documents",
   "/users": "Users",
 };

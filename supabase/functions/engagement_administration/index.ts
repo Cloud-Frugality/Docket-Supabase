@@ -16,6 +16,7 @@ import { callerTeams, LEVEL_OWN, requirePermission, type AccessAction } from "..
 import { RATE_LIMIT_RESPONSE, takeRateLimitToken } from "../_shared/rate-limit.ts";
 import { isLiveEntityOf } from "../_shared/legal-entities.ts";
 import { isOffered } from "../_shared/list-links.ts";
+import { applyFolderTemplate } from "../_shared/folder-template-apply.ts";
 import { effectiveCountry, loadOrgLocale } from "../_shared/organisation-locale.ts";
 
 // Engagements
@@ -273,6 +274,12 @@ async function handleCreateEngagement(
 
   if (error) {
     return internalError(request, error);
+  }
+  if (typeof createdEngagement?.id === "string") {
+    await applyFolderTemplate(serviceClient, "engagement", createdEngagement.id, callerId, {
+      teamId: fields.teamId,
+      engagementTypeId: fields.engagementTypeId,
+    });
   }
 
   return jsonResponse({

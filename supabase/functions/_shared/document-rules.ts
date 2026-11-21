@@ -3,6 +3,43 @@
 // (drift-tested). The types themselves are rows (document_categories). A Signed file is never removed, only superseded by a new
 // version.
 
+/**
+ * Whose removed files the recycle bin shows the caller. It follows who may
+ * restore one: Documents delete at All sees every removed file, at Own only
+ * their own uploads, and with neither the bin is closed. Reading at Own
+ * narrows it the same way. Levels are 0 none, 1 own, 2 all.
+ */
+export function binScope(
+  readLevel: number,
+  deleteLevel: number,
+  callerId: string,
+): { ok: true; uploader: string | null } | { ok: false; error: string } {
+  if (deleteLevel < 1) return { ok: false, error: "Only someone who can manage documents can open the recycle bin." };
+  return { ok: true, uploader: readLevel >= 2 && deleteLevel >= 2 ? null : callerId };
+}
+
+export const MAX_BIN_DAYS = 3650;
+
+/** How long the recycle bin keeps a removed file, as sent: whole days, or null to keep it until deleted by hand. */
+export function parseBinDays(raw: unknown): { ok: true; days: number | null } | { ok: false; error: string } {
+  if (raw === null || raw === "") return { ok: true, days: null };
+  const days = Number(raw);
+  if (!Number.isInteger(days) || days < 1 || days > MAX_BIN_DAYS) {
+    return { ok: false, error: `The recycle bin keeps files for a whole number of days from 1 to ${MAX_BIN_DAYS}.` };
+  }
+  return { ok: true, days };
+}
+
+/** The moment before which a removed file has been in the bin too long. */
+export function binCutoff(now: Date, days: number): string {
+  return new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/** People as filter options, by name. One with no name left reads as Unknown. */
+export function peopleOptions(ids: Iterable<string>, names: Map<string, string>): { id: string; name: string }[] {
+  return [...new Set(ids)].map((id) => ({ id, name: names.get(id) ?? "Unknown" })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
 /** The records that carry files, as the document tables name them. */
 export const DOCUMENT_RECORDS = ["engagement", "client", "feature_request"] as const;
 export type DocumentRecord = (typeof DOCUMENT_RECORDS)[number];

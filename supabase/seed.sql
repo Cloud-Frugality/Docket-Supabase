@@ -1,10 +1,14 @@
 -- Sample data for a fresh project. Run by scripts/seed.mjs after it has created
 -- the sample people (profiles come from auth users, which SQL can't make
--- cleanly). Refuses a database that already has clients or teams.
+-- cleanly) and before it uploads the sample files. Refuses a database that already has clients or teams.
 
 do $$
 declare
-  v_admin uuid := (select id from public.profiles where email = 'admin@example.com');
+  -- Whoever was made the first administrator.
+  v_admin uuid := (select p.id from public.profiles p
+                     join public.user_access_roles ur on ur.user_id = p.id
+                     join public.access_roles r on r.id = ur.role_id
+                    where r.name = 'Administrator' order by p.created_at limit 1);
   p_thandi uuid := (select id from public.profiles where email = 'thandi.mokoena@example.com');
   p_liam uuid := (select id from public.profiles where email = 'liam.oconnor@example.com');
   p_priya uuid := (select id from public.profiles where email = 'priya.naidoo@example.com');
@@ -20,7 +24,7 @@ declare
   ty_pov uuid := (select id from public.engagement_types where name = 'Proof of Value');
   c_meridian uuid; c_harbour uuid; c_northwind uuid; c_atlas uuid;
   c_kestrel uuid; c_solace uuid; c_brightmart uuid; c_civitas uuid;
-  card uuid;
+  g_legal uuid; g_finance uuid; g_cx uuid;
 begin
   if exists (select 1 from public.clients) or exists (select 1 from public.teams) then
     raise exception 'Seed refused: clients or teams already exist.';
@@ -87,7 +91,6 @@ begin
   update public.profiles p set phone = d.ph, country_code = d.c,
          employing_entity_id = (select id from public.legal_entities where client_id is null and registered_name = d.e)
     from (values
-      ('admin@example.com', 'Practice Head', '', 'ZA', 'NTT Data South Africa (Pty) Ltd'),
       ('thandi.mokoena@example.com', 'Client Director', '+27820000001', 'ZA', 'NTT Data South Africa (Pty) Ltd'),
       ('liam.oconnor@example.com', 'Solutions Architect', '+447700900001', 'GB', 'NTT Ltd'),
       ('priya.naidoo@example.com', 'Marketing Lead', '+27820000002', 'ZA', 'NTT Data South Africa (Pty) Ltd'),
@@ -97,7 +100,7 @@ begin
     ) as d(email, t, ph, c, e)
    where p.email = d.email;
   update public.profiles set can_sign = true, signing_limit = 5000000 where email = 'thandi.mokoena@example.com';
-  update public.profiles set can_sign = true where email = 'admin@example.com';
+  update public.profiles set can_sign = true where id = v_admin;
 
   -- ------------------------------------------------------------ engagements
   insert into public.engagements (organisation_id, client_id, team_id, engagement_type_id, name, reference, status, country_code, start_date, end_date, created_by) values
@@ -116,36 +119,41 @@ begin
     (v_org, c_brightmart, t_cx, ty_ps, 'Loyalty App', 'SOW-0900', 'closed', 'ZA', '2025-03-01', '2025-11-30', v_admin),
     (v_org, c_civitas, t_cx, ty_ps, 'Citizen Services Portal', 'SOW-1005', 'active', 'GB', '2026-05-01', '2027-04-30', v_admin);
 
-  -- ------------------------------------------------------------ rate cards
-  -- Hourly cost and sell per role and level; sell is cost plus a margin.
-  insert into public.rate_cards (client_id, engagement_type_id, status, effective_from, effective_to, created_by)
-    values (null, ty_ps, 'Active', '2026-01-01', '2026-12-31', v_admin) returning id into card;
-  insert into public.rate_card_entries (rate_card_id, resource_role, resource_level, cost_rate, sell_rate)
-  select card, r, l, base * m, round(base * m * 1.65)
-    from (values ('Developer', 600), ('Business Analyst', 620), ('Project Manager', 700), ('Architect', 900)) as roles(r, base),
-         (values ('Junior', 1.0), ('Intermediate', 1.35), ('Senior', 1.75)) as levels(l, m);
+  -- ------------------------------------------------------------ approval
+  -- How long approved paper is kept.
+  update public.document_categories c set retention_years = r.years
+    from (values ('Contract', 7), ('Master Services Agreement', 7), ('Statement of Work', 5),
+                 ('Purchase Order', 5), ('Invoice', 5), ('Non-Disclosure Agreement', 3)) as r(name, years)
+   where c.name = r.name;
 
-  insert into public.rate_cards (client_id, engagement_type_id, status, effective_from, effective_to, created_by)
-    values (null, ty_ms, 'Active', '2026-01-01', '2026-12-31', v_admin) returning id into card;
-  insert into public.rate_card_entries (rate_card_id, resource_role, resource_level, cost_rate, sell_rate)
-  select card, r, l, base * m, round(base * m * 1.5)
-    from (values ('Support Engineer', 450), ('Service Delivery Manager', 750), ('Operations Manager', 800)) as roles(r, base),
-         (values ('Junior', 1.0), ('Intermediate', 1.3), ('Senior', 1.6)) as levels(l, m);
+  -- Each team's default approvers; HR has none, so its files go to its team admin.
+  insert into public.team_approvers (team_id, profile_id, created_by) values
+    (t_cx, v_admin, v_admin), (t_cx, p_thandi, v_admin), (t_marketing, p_priya, v_admin);
 
-  -- Meridian's negotiated card, and next year's standard card still in draft.
-  insert into public.rate_cards (client_id, engagement_type_id, status, effective_from, effective_to, created_by)
-    values (c_meridian, ty_ps, 'Active', '2026-03-01', '2027-02-28', v_admin) returning id into card;
-  insert into public.rate_card_entries (rate_card_id, resource_role, resource_level, cost_rate, sell_rate)
-  select card, r, l, base * m, round(base * m * 1.5)
-    from (values ('Developer', 600), ('Architect', 900), ('Product Owner', 680)) as roles(r, base),
-         (values ('Intermediate', 1.35), ('Senior', 1.75)) as levels(l, m);
+  -- Two organisation groups and one team group. Finance needs everyone.
+  insert into public.approver_groups (organisation_id, name, created_by)
+    values (v_org, 'Legal Review', v_admin) returning id into g_legal;
+  insert into public.approver_groups (organisation_id, name, requires_all, created_by)
+    values (v_org, 'Finance Sign-off', true, v_admin) returning id into g_finance;
+  insert into public.approver_groups (organisation_id, team_id, name, created_by)
+    values (v_org, t_cx, 'CX Leads', v_admin) returning id into g_cx;
+  insert into public.approver_group_members (group_id, profile_id) values
+    (g_legal, v_admin), (g_legal, p_priya),
+    (g_finance, v_admin), (g_finance, p_thandi), (g_finance, p_ahmed),
+    (g_cx, p_thandi), (g_cx, p_emma);
 
-  insert into public.rate_cards (client_id, engagement_type_id, status, effective_from, effective_to, created_by)
-    values (null, ty_ps, 'Draft', '2027-01-01', '2027-12-31', v_admin) returning id into card;
-  insert into public.rate_card_entries (rate_card_id, resource_role, resource_level, cost_rate, sell_rate)
-  select card, r, l, round(base * m * 1.06), round(base * m * 1.06 * 1.65)
-    from (values ('Developer', 600), ('Business Analyst', 620), ('Project Manager', 700), ('Architect', 900)) as roles(r, base),
-         (values ('Junior', 1.0), ('Intermediate', 1.35), ('Senior', 1.75)) as levels(l, m);
+  -- Contracts go to Legal wherever they are filed; purchase orders to Finance
+  -- on two teams; Meridian's statements of work to Legal.
+  insert into public.approval_rules (team_id, category_id, group_id, created_by)
+    select t, c.id, g_legal, v_admin from unnest(array[t_cx, t_marketing, t_hr]) as t, public.document_categories c
+     where c.name in ('Contract', 'Master Services Agreement');
+  insert into public.approval_rules (team_id, category_id, group_id, created_by)
+    select t, c.id, g_finance, v_admin from unnest(array[t_cx, t_marketing]) as t, public.document_categories c
+     where c.name = 'Purchase Order';
+  insert into public.approval_rules (team_id, category_id, group_id, created_by)
+    select t_cx, c.id, g_cx, v_admin from public.document_categories c where c.name = 'Solution Design';
+  insert into public.approval_rules (client_id, category_id, group_id, created_by)
+    select c_meridian, c.id, g_legal, v_admin from public.document_categories c where c.name = 'Statement of Work';
 
   -- ------------------------------------------------------------ feedback
   insert into public.bug_reports (title, location, defect_type, severity, browser, status, description, steps_to_reproduce, route, created_by) values

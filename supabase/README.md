@@ -22,6 +22,20 @@ Set in the Supabase dashboard (not the frontend `.env`):
 
 - `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (or `SUPABASE_SERVICE_ROLE_KEY`), `SUPABASE_PUBLISHABLE_KEY` (or `SUPABASE_ANON_KEY`)
 - `ALLOWED_ORIGINS`: comma-separated browser origins
+- `CRON_SECRET`: lets the database's nightly job call `bin_sweep`. Any long random value.
+
+## The nightly recycle bin job
+
+`bin_sweep` deletes for good what has been in the recycle bin longer than the organisation keeps it. The database calls it every night (`cron.schedule('recycle-bin-sweep', ...)`, 01:15 UTC). It has no signed-in caller, so it is the one function deployed with `--no-verify-jwt`, and it lets in only a call carrying `CRON_SECRET` in the `x-cron-secret` header.
+
+Set once per project, in the SQL editor, never in a migration:
+
+```sql
+select vault.create_secret('https://<ref>.supabase.co', 'project_url');
+select vault.create_secret('<the same value as CRON_SECRET>', 'cron_secret');
+```
+
+Deploy with `SUPABASE_PROJECT_REF=<ref> node scripts/deploy-fn.mjs bin_sweep --no-verify-jwt`. To see how the runs went: `select * from cron.job_run_details order by start_time desc limit 5;` and `select status_code, content from net._http_response order by created desc limit 5;`.
 
 ## Migrations
 
