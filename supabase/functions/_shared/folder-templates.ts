@@ -60,13 +60,34 @@ export function pickTemplate<T extends FolderTemplate>(templates: T[], target: {
   return best;
 }
 
-/** The folder rows a template makes, each knowing the row it sits inside. */
-export function templateRows(folders: string[], newId: () => string): { id: string; parentId: string | null; name: string }[] {
-  const idOf = new Map<string, string>();
-  return folders.map((path) => {
+/** The folders a record already has, by path without case ("contracts/signed"), to its id. */
+export function existingFolderPaths(folders: readonly { id: string; parentId: string | null; name: string }[]): Map<string, string> {
+  const byId = new Map(folders.map((f) => [f.id, f]));
+  const pathOf = (f: { parentId: string | null; name: string }): string => {
+    const parent = f.parentId ? byId.get(f.parentId) : undefined;
+    return (parent ? `${pathOf(parent)}/${f.name}` : f.name).toLowerCase();
+  };
+  return new Map(folders.map((f) => [pathOf(f), f.id]));
+}
+
+/**
+ * The folder rows a template makes, each knowing the row it sits inside. A
+ * folder the record already has is left as it is, and new ones inside it are
+ * hung from it, so a template can be applied to a record with folders.
+ */
+export function templateRows(
+  folders: string[],
+  newId: () => string,
+  existing: ReadonlyMap<string, string> = new Map(),
+): { id: string; parentId: string | null; name: string }[] {
+  const idOf = new Map(existing);
+  const rows: { id: string; parentId: string | null; name: string }[] = [];
+  for (const path of folders) {
+    if (idOf.has(path.toLowerCase())) continue;
     const cut = path.lastIndexOf("/");
     const id = newId();
-    idOf.set(path, id);
-    return { id, parentId: cut < 0 ? null : (idOf.get(path.slice(0, cut)) ?? null), name: path.slice(cut + 1) };
-  });
+    idOf.set(path.toLowerCase(), id);
+    rows.push({ id, parentId: cut < 0 ? null : (idOf.get(path.slice(0, cut).toLowerCase()) ?? null), name: path.slice(cut + 1) });
+  }
+  return rows;
 }

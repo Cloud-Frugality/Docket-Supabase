@@ -3,6 +3,8 @@
 // (drift-tested). The types themselves are rows (document_categories). A Signed file is never removed, only superseded by a new
 // version.
 
+import { parseCustomValues, type CategoryField } from "./document-fields.ts";
+
 /**
  * Whose removed files the recycle bin shows the caller. It follows who may
  * restore one: Documents delete at All sees every removed file, at Own only
@@ -53,6 +55,8 @@ export const FEATURE_REQUEST_DOCUMENT_TYPES = ["Specification", "Screenshot", "O
 export interface AllowedTypes {
   types: readonly string[];
   binding: readonly string[];
+  /** The fields each type asks for, by type name. Absent means none. */
+  fields?: Record<string, CategoryField[]>;
 }
 
 /** Draft while being worked on, Final once settled, Signed once executed.
@@ -76,6 +80,8 @@ export interface DocumentMetadata {
   effectiveFrom: string | null;
   effectiveTo: string | null;
   note: string | null;
+  /** Its answers to its category's own fields, by field key. */
+  custom: Record<string, string>;
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -124,6 +130,9 @@ export function parseDocumentMetadata(
     return { ok: false, error: "A document cannot stop being effective before it starts." };
   }
 
+  const custom = parseCustomValues(allowed.fields?.[documentType] ?? [], raw.custom);
+  if (!custom.ok) return { ok: false, error: custom.error };
+
   return {
     ok: true,
     value: {
@@ -133,13 +142,14 @@ export function parseDocumentMetadata(
       effectiveFrom: effectiveFrom || null,
       effectiveTo: effectiveTo || null,
       note: note || null,
+      custom: custom.values,
     },
   };
 }
 
 /** Files uploaded before metadata existed count as Other and Final. */
 export function legacyMetadata(): DocumentMetadata {
-  return { documentType: "Other", status: "Final", reference: null, effectiveFrom: null, effectiveTo: null, note: null };
+  return { documentType: "Other", status: "Final", reference: null, effectiveFrom: null, effectiveTo: null, note: null, custom: {} };
 }
 
 /**

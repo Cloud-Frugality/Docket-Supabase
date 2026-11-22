@@ -13,6 +13,9 @@ import { TERM_KEYS, cleanTerm } from "../_shared/terms.ts";
 import { idList } from "../_shared/list-links.ts";
 import { parseTemplateFolders } from "../_shared/folder-templates.ts";
 import { parseBinDays } from "../_shared/document-rules.ts";
+import { parseUploadRules, storedUploadRules, uploadMimeTypes } from "../_shared/upload-rules.ts";
+import { parseChecksOff, UPLOAD_CHECKS } from "../_shared/file-inspection.ts";
+import { parseCategoryFields, storedFields } from "../_shared/document-fields.ts";
 import { allowedDocumentTypes } from "../_shared/document-categories.ts";
 import { draftRuleRight, parseGroupName, parseRetentionYears, RULE_SCOPES, type RuleScope } from "../_shared/file-approval.ts";
 import {
@@ -49,7 +52,7 @@ async function roleInTeam(serviceClient: ServiceClient, teamId: string, userId: 
 async function theOrganisation(serviceClient: ServiceClient) {
   return await serviceClient
     .from("organisations")
-    .select("id, name, default_country_code, lock_country, default_currency, lock_currency, time_zone, date_format, clients_enabled, engagements_enabled, allow_self_approval, bin_retention_days, client_term, clients_term, engagement_term, engagements_term")
+    .select("id, name, default_country_code, lock_country, default_currency, lock_currency, time_zone, date_format, clients_enabled, engagements_enabled, allow_self_approval, bin_retention_days, upload_types, upload_max_mb, upload_checks_off, client_term, clients_term, engagement_term, engagements_term")
     .order("created_at")
     .limit(1)
     .single();
@@ -243,7 +246,7 @@ Deno.serve((request) =>
     // offer them), with how many files are of each.
     if (resource === "categories") {
       const { data: categories, error } = await selectAllRows(() =>
-        serviceClient.from("document_categories").select("id, name, code, sort_order, is_active, is_binding, retention_years").order("sort_order").order("id")
+        serviceClient.from("document_categories").select("id, name, code, sort_order, is_active, is_binding, retention_years, fields").order("sort_order").order("id")
       );
       if (error) return internalError(request, error, "categories");
       const counts = new Map<string, number>();
@@ -266,6 +269,7 @@ Deno.serve((request) =>
           isActive: c.is_active,
           isBinding: c.is_binding,
           retentionYears: c.retention_years ?? null,
+          fields: storedFields(c.fields),
           fileCount: counts.get(String(c.name)) ?? 0,
           engagementTypeIds: typeLinks.data.filter((l) => l.category_id === c.id).map((l) => String(l.engagement_type_id)),
           businessUnitIds: unitLinks.data.filter((l) => l.category_id === c.id).map((l) => String(l.business_unit_id)),
@@ -283,7 +287,9 @@ Deno.serve((request) =>
       }
       try {
         const allowed = await allowedDocumentTypes(serviceClient, record, recordId || null);
-        return jsonResponse({ types: allowed.types.map((name) => ({ name, binding: allowed.binding.includes(name) })) }, request);
+        return jsonResponse({
+          types: allowed.types.map((name) => ({ name, binding: allowed.binding.includes(name), fields: allowed.fields?.[name] ?? [] })),
+        }, request);
       } catch (error) {
         return internalError(request, error, "document types");
       }
@@ -468,6 +474,11 @@ Deno.serve((request) =>
         // On: someone may approve a document they wrote.
         allowSelfApproval: org.allow_self_approval === true,
         binRetentionDays: typeof org.bin_retention_days === "number" ? org.bin_retention_days : null,
+        // The kinds of file that may be uploaded, and how big one may be.
+        uploadTypes: storedUploadRules(org.upload_types, org.upload_max_mb).types,
+        uploadMaxMb: storedUploadRules(org.upload_types, org.upload_max_mb).maxMb,
+        // The checks on an uploaded file that are switched off.
+        uploadChecksOff: parseChecksOff(org.upload_checks_off) ?? [],
         // What the organisation calls a client and an engagement.
         terms: { client: org.client_term, clients: org.clients_term, engagement: org.engagement_term, engagements: org.engagements_term },
       },
@@ -705,6 +716,11 @@ Deno.serve((request) =>
       ? { ok: true as const, days: typeof org.bin_retention_days === "number" ? org.bin_retention_days : null }
       : parseBinDays(payload.binRetentionDays);
     if (!binDays.ok) return jsonResponse({ error: binDays.error }, request, 400);
+    // What may be uploaded, changed only when both parts are sent.
+    const upload = payload.uploadTypes === undefined || payload.uploadMaxMb === undefined
+      ? null
+      : parseUploadRules(payload.uploadTypes, payload.uploadMaxMb);
+    if (upload && !upload.ok) return jsonResponse({ error: upload.error }, request, 400);
     // Its own words for a client and an engagement, each kept unless sent.
     const sent = (payload.terms && typeof payload.terms === "object" ? payload.terms : {}) as Record<string, unknown>;
     const terms: Record<string, string> = {};
@@ -730,6 +746,16 @@ Deno.serve((request) =>
       })
       .eq("id", org.id);
     if (nameError) return internalError(request, nameError, "organisation update");
+    if (upload?.ok) {
+      // The storage buckets are set to the same limits in the same transaction.
+      const { error: uploadError } = await serviceClient.rpc("save_upload_rules", {
+        p_organisation_id: org.id,
+        p_types: upload.rules.types,
+        p_max_mb: upload.rules.maxMb,
+        p_mime_types: uploadMimeTypes(upload.rules.types),
+      });
+      if (uploadError) return internalError(request, uploadError, "upload rules");
+    }
     const { error } = await serviceClient.rpc("save_organisation_locale", {
       p_country: country,
       p_lock_country: lockCountry,
@@ -739,6 +765,23 @@ Deno.serve((request) =>
     });
     if (error) return internalError(request, error, "organisation locale");
     return jsonResponse({ message: "Organisation updated." }, request);
+  };
+
+  // POST { off }: which of the checks on an uploaded file are switched off. The whole list, each time.
+  const saveUploadChecks = async (): Promise<Response> => {
+    if (!globalAdmin) return jsonResponse({ error: GLOBAL_ONLY }, request, 403);
+    const off = parseChecksOff(payload.off);
+    if (!off || !Array.isArray(payload.off) || off.length !== new Set(payload.off).size) {
+      return jsonResponse({ error: `The checks switched off must be a list of: ${UPLOAD_CHECKS.join(", ")}.` }, request, 400);
+    }
+    const { data: org, error: orgErr } = await theOrganisation(serviceClient);
+    if (orgErr) return internalError(request, orgErr, "organisation");
+    const { error } = await serviceClient
+      .from("organisations")
+      .update({ upload_checks_off: off, updated_at: new Date().toISOString(), updated_by: callerId })
+      .eq("id", org.id);
+    if (error) return internalError(request, error, "upload checks");
+    return jsonResponse({ message: "Upload security saved." }, request);
   };
 
   // Engagement types: global admins keep the list. A type in use is switched off
@@ -938,6 +981,9 @@ Deno.serve((request) =>
     // Years an approved file is kept. Not sent means unchanged.
     const retention = "retentionYears" in payload ? parseRetentionYears(payload.retentionYears) : null;
     if (retention && !retention.ok) return jsonResponse({ error: retention.error }, request, 400);
+    // The fields its files answer. Not sent means unchanged.
+    const fields = "fields" in payload ? parseCategoryFields(payload.fields) : null;
+    if (fields && !fields.ok) return jsonResponse({ error: fields.error }, request, 400);
     // Saved with the category; one that has since gone refuses the lot.
     const saveLinks = async (id: string): Promise<Response | null> => {
       const { error } = await serviceClient.rpc("replace_document_category_links", { p_category_id: id, p_type_ids: typeIds, p_unit_ids: unitIds });
@@ -961,9 +1007,12 @@ Deno.serve((request) =>
       });
       if (error) return isUniqueViolation(error) ? duplicate() : internalError(request, error, "category update");
       if (found !== true) return jsonResponse({ error: "Category not found." }, request, 404);
-      if (retention?.ok) {
-        const { error: keptError } = await serviceClient.from("document_categories").update({ retention_years: retention.years }).eq("id", categoryId);
-        if (keptError) return internalError(request, keptError, "category retention");
+      if (retention?.ok || fields?.ok) {
+        const { error: keptError } = await serviceClient
+          .from("document_categories")
+          .update({ ...(retention?.ok ? { retention_years: retention.years } : {}), ...(fields?.ok ? { fields: fields.fields } : {}) })
+          .eq("id", categoryId);
+        if (keptError) return internalError(request, keptError, "category retention and fields");
       }
       return (await saveLinks(categoryId)) ?? jsonResponse({ message: "Category saved." }, request);
     }
@@ -973,7 +1022,7 @@ Deno.serve((request) =>
       .from("document_categories").select("sort_order").order("sort_order", { ascending: false }).limit(1).maybeSingle();
     const { data, error } = await serviceClient
       .from("document_categories")
-      .insert({ organisation_id: org.id, name: details.name, code, is_binding: payload.isBinding === true, retention_years: retention?.ok ? retention.years : null, sort_order: Number(last?.sort_order ?? 0) + 1, created_by: callerId })
+      .insert({ organisation_id: org.id, name: details.name, code, is_binding: payload.isBinding === true, retention_years: retention?.ok ? retention.years : null, fields: fields?.ok ? fields.fields : [], sort_order: Number(last?.sort_order ?? 0) + 1, created_by: callerId })
       .select("id")
       .single();
     if (error) return isUniqueViolation(error) ? duplicate() : internalError(request, error, "category insert");
@@ -1144,6 +1193,7 @@ Deno.serve((request) =>
     save_members: saveMembers,
     update_person_teams: updatePersonTeams,
     update_organisation: updateOrganisation,
+    save_upload_checks: saveUploadChecks,
     create_business_unit: createBusinessUnit,
     update_business_unit: updateBusinessUnit,
     delete_business_unit: deleteBusinessUnit,

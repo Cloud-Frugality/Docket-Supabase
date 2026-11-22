@@ -5,6 +5,7 @@
 import type { ServiceClient } from "./service-client.ts";
 import { isOffered } from "./list-links.ts";
 import { FEATURE_REQUEST_DOCUMENT_TYPES, type AllowedTypes, type DocumentRecord } from "./document-rules.ts";
+import { storedFields } from "./document-fields.ts";
 
 type Row = Record<string, unknown>;
 const ids = (rows: unknown, key: string) => ((rows ?? []) as Row[]).map((r) => String(r[key]));
@@ -25,7 +26,7 @@ export async function allowedDocumentTypes(
   const [categories, engagement] = await Promise.all([
     serviceClient
       .from("document_categories")
-      .select("name, is_active, is_binding, document_category_engagement_types(engagement_type_id), document_category_business_units(business_unit_id)")
+      .select("name, is_active, is_binding, fields, document_category_engagement_types(engagement_type_id), document_category_business_units(business_unit_id)")
       .order("sort_order").order("id"),
     record === "engagement" && entityId
       ? serviceClient.from("engagements").select("engagement_type_id, teams(business_unit_id)").eq("id", entityId).maybeSingle()
@@ -47,5 +48,6 @@ export async function allowedDocumentTypes(
   return {
     types: rows.filter((c) => c.name === keep || (c.is_active === true && offered(c))).map((c) => String(c.name)),
     binding: rows.filter((c) => c.is_binding === true).map((c) => String(c.name)),
+    fields: Object.fromEntries(rows.map((c) => [String(c.name), storedFields(c.fields)])),
   };
 }

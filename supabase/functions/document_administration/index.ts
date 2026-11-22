@@ -23,6 +23,14 @@ import {
 } from "../_shared/file-approval.ts";
 import { loadRouting, type Routing } from "../_shared/approval-routing.ts";
 import { folderDeleteRefusal, parseFolderName } from "../_shared/document-folders.ts";
+import { disposalRefusal, extensionRefusal, MAX_DISPOSAL_REASON } from "../_shared/document-disposal.ts";
+import { accessPeople, shareSummary, type DocumentAccess } from "../_shared/document-access.ts";
+import { applyDocumentAccess, applyOwnScope, applyShared, loadDocumentAccess, rowShared, rowVisible } from "../_shared/document-access-load.ts";
+import { logDocumentEvent } from "../_shared/document-events-log.ts";
+import { addTemplateFolders } from "../_shared/folder-template-apply.ts";
+import { idList } from "../_shared/list-links.ts";
+import { allowedDocumentTypes } from "../_shared/document-categories.ts";
+import { leaveRefusal, mayFileOnClient, mayFileOnEngagement, moveTargets, type Mover } from "../_shared/document-move.ts";
 
 /**
  * The Documents page and everything that happens to a stored file after it is
@@ -64,7 +72,7 @@ const EXPIRING_DAYS = 60;
 const DASHBOARD_ROWS = 8;
 
 const REGISTER_COLUMNS =
-  "id, record, record_id, record_name, client_id, client_name, work_type, team_id, record_archived_at, file_name, content_type, size_bytes, uploaded_by, created_at, document_type, status, reference, effective_from, effective_to, note, family_id, version, version_count, is_latest, updated_at, updated_by, archived_at, archived_by, approval_state, submitted_by, submitted_at, decided_by, decided_for, decided_at, decision_comment, on_hold, retain_until, folder_id";
+  "id, record, record_id, record_name, client_id, client_name, work_type, team_id, record_archived_at, file_name, content_type, size_bytes, uploaded_by, created_at, document_type, status, reference, effective_from, effective_to, note, family_id, version, version_count, is_latest, updated_at, updated_by, archived_at, archived_by, approval_state, submitted_by, submitted_at, decided_by, decided_for, decided_at, decision_comment, on_hold, retain_until, folder_id, custom, restricted";
 
 type Row = Record<string, unknown>;
 
@@ -80,10 +88,15 @@ function addDays(isoDate: string, days: number): string {
 const orgToday = async (serviceClient: ServiceClient) => appToday(new Date(), (await loadOrgLocale(serviceClient)).timeZone);
 
 // deno-lint-ignore no-explicit-any
-function applyFilters(query: any, params: URLSearchParams, ownUploader: string | null, today: string, removed = false) {
+function applyFilters(query: any, params: URLSearchParams, ownUploader: string | null, today: string, access: DocumentAccess, removed = false) {
   // The recycle bin lists what was removed; everything else the live, latest versions.
   let q = removed ? query.not("archived_at", "is", null) : query.eq("is_latest", true);
-  if (ownUploader) q = q.eq("uploaded_by", ownUploader);
+  // The bin is only ever your own removals; a share doesn't reach into it.
+  if (removed) q = ownUploader ? q.eq("uploaded_by", ownUploader) : q;
+  else q = applyOwnScope(q, ownUploader, access);
+  q = applyDocumentAccess(q, access);
+  // Shared with Me: only what someone shared with the caller.
+  if (params.get("shared") === "true") q = applyShared(q, access) ?? q;
 
   const records = list(params, "records").filter((r) => r in REGISTER);
   if (records.length) q = q.in("record", records);
@@ -95,6 +108,8 @@ function applyFilters(query: any, params: URLSearchParams, ownUploader: string |
   if (approvalStates.length) q = q.in("approval_state", approvalStates);
   // Kept: on hold, or still inside its retention period.
   if (params.get("kept") === "true") q = q.or(`on_hold.eq.true,retain_until.gt.${today}`);
+  // Due: its retention has run out and nothing holds it, so it waits for review.
+  if (params.get("due") === "true") q = q.not("retain_until", "is", null).lte("retain_until", today).eq("on_hold", false);
   const clientIds = list(params, "clientIds").filter(isUuid);
   if (clientIds.length) q = q.in("client_id", clientIds);
   // The one client or engagement a folder of the Documents page stands for.
@@ -179,6 +194,8 @@ function toDocument(row: Row, names: Map<string, string>) {
     onHold: row.on_hold === true,
     retainUntil: row.retain_until ?? null,
     folderId: row.folder_id ?? null,
+    custom: row.custom && typeof row.custom === "object" ? row.custom : {},
+    restricted: row.restricted === true,
   };
 }
 
@@ -256,15 +273,20 @@ async function standingOn(serviceClient: ServiceClient, callerId: string, row: R
 
 // ---------------------------------------------------------------- reads
 
-async function handleList(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null, removed = false) {
+async function handleList(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null, access: DocumentAccess, removed = false) {
   const offset = Math.max(0, Number.parseInt(params.get("offset") ?? "0", 10) || 0);
   const limit = Math.min(MAX_PAGE, Math.max(1, Number.parseInt(params.get("limit") ?? "24", 10) || 24));
+  // Nothing is shared with the caller, so there is nothing to ask for.
+  if (params.get("shared") === "true" && access.sharedFamilies.size === 0 && access.sharedFolders.size === 0) {
+    return jsonResponse({ documents: [], total: 0 }, request);
+  }
 
   const { data, error, count } = await applyFilters(
     serviceClient.from("document_register").select(REGISTER_COLUMNS, { count: "exact" }),
     params,
     ownUploader,
     await orgToday(serviceClient),
+    access,
     removed,
   )
     // The bin reads newest removed first.
@@ -280,14 +302,13 @@ async function handleList(serviceClient: ServiceClient, request: Request, params
 
 /** The filter drawer's options: only clients, types and kinds of work that
  *  have a file, so it never offers a choice that finds nothing. */
-async function handleFacets(serviceClient: ServiceClient, request: Request, ownUploader: string | null) {
+async function handleFacets(serviceClient: ServiceClient, request: Request, ownUploader: string | null, access: DocumentAccess) {
   const { data, error } = await selectAllRows(() => {
-    let q = serviceClient
+    const q = serviceClient
       .from("document_register")
       .select("id, record, client_id, client_name, document_type, work_type, uploaded_by")
       .eq("is_latest", true);
-    if (ownUploader) q = q.eq("uploaded_by", ownUploader);
-    return q.order("id");
+    return applyDocumentAccess(applyOwnScope(q, ownUploader, access), access).order("id");
   });
   if (error) return internalError(request, error, "document facets");
 
@@ -314,30 +335,79 @@ async function handleFacets(serviceClient: ServiceClient, request: Request, ownU
 const folderOwner = (record: string) => (record === "client" ? "client_id" : "engagement_id");
 
 /** Every folder on one client or engagement. The page nests them by parent. */
-async function handleFolders(serviceClient: ServiceClient, request: Request, params: URLSearchParams) {
+async function handleFolders(serviceClient: ServiceClient, request: Request, params: URLSearchParams, access: DocumentAccess) {
   const record = params.get("record") ?? "";
   const recordId = params.get("recordId") ?? "";
   if (!(record in REGISTER) || !isUuid(recordId)) return jsonResponse({ error: "Invalid record." }, request, 400);
   const { data, error } = await serviceClient
     .from("document_folders")
-    .select("id, parent_id, name")
+    .select("id, parent_id, name, restricted")
     .eq(folderOwner(record), recordId)
     .order("name");
   if (error) return internalError(request, error, "document folders");
   return jsonResponse({
-    folders: ((data ?? []) as Row[]).map((f) => ({ id: f.id, parentId: f.parent_id ?? null, name: f.name })),
+    // A restricted folder the caller isn't named for is left out, with everything in it.
+    folders: ((data ?? []) as Row[])
+      .filter((f) => !access.deniedFolders.has(String(f.id)))
+      .map((f) => ({ id: f.id, parentId: f.parent_id ?? null, name: f.name, restricted: f.restricted === true })),
+  }, request);
+}
+
+/** Every folder the caller may enter, on every record, for the tree's search. */
+async function handleAllFolders(serviceClient: ServiceClient, request: Request, access: DocumentAccess) {
+  const { data, error } = await selectAllRows(() =>
+    serviceClient.from("document_folders").select("id, parent_id, name, restricted, client_id, engagement_id").order("id")
+  );
+  if (error) return internalError(request, error, "document folders");
+  return jsonResponse({
+    folders: (data as Row[])
+      .filter((f) => !access.deniedFolders.has(String(f.id)))
+      .map((f) => ({
+        id: f.id,
+        parentId: f.parent_id ?? null,
+        name: f.name,
+        restricted: f.restricted === true,
+        record: f.client_id ? "client" : "engagement",
+        recordId: f.client_id ?? f.engagement_id,
+      })),
+  }, request);
+}
+
+/** Who is asking, for the rules on adding a file to a client or an engagement. */
+async function moverOf(serviceClient: ServiceClient, callerId: string, caller: CallerTeams): Promise<Mover> {
+  const [clientLevel, engagementLevel] = await Promise.all([
+    callerLevel(serviceClient, callerId, "Clients", "write"),
+    callerLevel(serviceClient, callerId, "Engagements", "write"),
+  ]);
+  return { callerId, clientLevel, engagementLevel, globalAdmin: caller.globalAdmin, teamIds: caller.teamIds };
+}
+
+/** Every client and engagement the caller may move a file to. */
+async function handleMoveTargets(serviceClient: ServiceClient, request: Request, callerId: string, caller: CallerTeams) {
+  const [who, clients, engagements] = await Promise.all([
+    moverOf(serviceClient, callerId, caller),
+    selectAllRows(() => serviceClient.from("clients").select("id, name, created_by").is("archived_at", null).order("id")),
+    selectAllRows(() => serviceClient.from("engagements").select("id, name, client_id, team_id").is("archived_at", null).order("id")),
+  ]);
+  const failed = clients.error ?? engagements.error;
+  if (failed) return internalError(request, failed, "move targets");
+  return jsonResponse({
+    targets: moveTargets(
+      clients.data.map((c) => ({ id: String(c.id), name: String(c.name), createdBy: typeof c.created_by === "string" ? c.created_by : null })),
+      engagements.data.map((e) => ({ id: String(e.id), name: String(e.name), clientId: String(e.client_id), teamId: String(e.team_id) })),
+      who,
+    ),
   }, request);
 }
 
 /** One file's family: every version, removed ones flagged, newest first. */
-async function handleVersions(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null) {
+async function handleVersions(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null, access: DocumentAccess) {
   const record = params.get("record") ?? "";
   const familyId = params.get("familyId") ?? "";
   if (!(record in REGISTER) || !isUuid(familyId)) return jsonResponse({ error: "Invalid document." }, request, 400);
 
-  let q = serviceClient.from("document_register").select(REGISTER_COLUMNS).eq("record", record).eq("family_id", familyId);
-  if (ownUploader) q = q.eq("uploaded_by", ownUploader);
-  const { data, error } = await q.order("version", { ascending: false });
+  const q = serviceClient.from("document_register").select(REGISTER_COLUMNS).eq("record", record).eq("family_id", familyId);
+  const { data, error } = await applyDocumentAccess(applyOwnScope(q, ownUploader, access), access).order("version", { ascending: false });
   if (error) return internalError(request, error, "document versions");
   const rows = (data ?? []) as Row[];
   const names = await namesFor(serviceClient, rows);
@@ -345,8 +415,9 @@ async function handleVersions(serviceClient: ServiceClient, request: Request, pa
 }
 
 /** Home: what waits on the caller, what was added last, and how the files stand. */
-async function handleDashboard(serviceClient: ServiceClient, request: Request, callerId: string, ownUploader: string | null) {
-  const own = <Q extends { eq: (column: string, value: string) => Q }>(q: Q) => (ownUploader ? q.eq("uploaded_by", ownUploader) : q);
+async function handleDashboard(serviceClient: ServiceClient, request: Request, callerId: string, ownUploader: string | null, access: DocumentAccess) {
+  // deno-lint-ignore no-explicit-any
+  const own = (q: any) => applyDocumentAccess(applyOwnScope(q, ownUploader, access), access);
   const latest = () => serviceClient.from("document_register").select("id", { count: "exact", head: true }).eq("is_latest", true);
   const [waiting, recent, caller, ...counts] = await Promise.all([
     // Every waiting file, whoever uploaded it: an approver need not own it.
@@ -363,7 +434,8 @@ async function handleDashboard(serviceClient: ServiceClient, request: Request, c
   const standing = await standings(serviceClient, callerId, caller, waiting.data);
   // Not the ones the caller has already approved and others still hold.
   const mine = waiting.data
-    .filter((row) => waitsOn(standing.get(String(row.id))))
+    // A restricted file stays hidden even from someone who could approve it.
+    .filter((row) => rowVisible(row, access) && waitsOn(standing.get(String(row.id))))
     .sort((a, b) => String(a.submitted_at ?? "").localeCompare(String(b.submitted_at ?? "")));
   const recentRows = (recent.data ?? []) as Row[];
   const names = await namesFor(serviceClient, [...mine, ...recentRows]);
@@ -377,13 +449,13 @@ async function handleDashboard(serviceClient: ServiceClient, request: Request, c
 }
 
 /** One file's approval, hold and retention, and what this caller may do about them. */
-async function handleApproval(serviceClient: ServiceClient, request: Request, params: URLSearchParams, callerId: string, readLevel: number) {
+async function handleApproval(serviceClient: ServiceClient, request: Request, params: URLSearchParams, callerId: string, readLevel: number, access: DocumentAccess) {
   const record = params.get("record") ?? "";
   const documentId = params.get("documentId") ?? "";
   if (!(record in REGISTER) || !isUuid(documentId)) return jsonResponse({ error: "Invalid document." }, request, 400);
   const { row, error } = await readRegisterRow(serviceClient, record, documentId);
   if (error) return internalError(request, error, "read document");
-  if (!row) return jsonResponse({ error: "Document not found." }, request, 404);
+  if (!row || !rowVisible(row, access)) return jsonResponse({ error: "Document not found." }, request, 404);
 
   const [standing, writeLevel, deleteLevel, today, flags, given] = await Promise.all([
     standingOn(serviceClient, callerId, row),
@@ -397,7 +469,7 @@ async function handleApproval(serviceClient: ServiceClient, request: Request, pa
   const right = standing?.right ?? null;
   const routing = standing?.routing ?? null;
   const mine = row.uploaded_by === callerId;
-  if (readLevel < LEVEL_ALL && !mine && !right?.ok) return jsonResponse({ error: "Document not found." }, request, 404);
+  if (readLevel < LEVEL_ALL && !mine && !right?.ok && !rowShared(row, access)) return jsonResponse({ error: "Document not found." }, request, 404);
 
   const approvedIds = ((given.data ?? []) as Row[]).map((a) => String(a.profile_id));
   const names = await buildDisplayNameMap(serviceClient, new Set([
@@ -449,16 +521,18 @@ async function handleApproval(serviceClient: ServiceClient, request: Request, pa
   }, request);
 }
 
-async function handleUrl(serviceClient: ServiceClient, request: Request, params: URLSearchParams, callerId: string, readLevel: number) {
+async function handleUrl(serviceClient: ServiceClient, request: Request, params: URLSearchParams, callerId: string, readLevel: number, access: DocumentAccess) {
   const record = params.get("record") ?? "";
   const documentId = params.get("documentId") ?? "";
   if (!(record in REGISTER) || !isUuid(documentId)) return jsonResponse({ error: "Invalid document." }, request, 400);
   const cfg = REGISTER[record];
   const { row, error } = await readRegisterRow(serviceClient, record, documentId);
   if (error) return internalError(request, error, "read document");
-  // At Own: your uploads, and a file waiting on your decision (you can't
-  // approve what you can't read).
-  const visible = !!row && (readLevel >= LEVEL_ALL || row.uploaded_by === callerId || (await standingOn(serviceClient, callerId, row))?.right.ok === true);
+  // At Own: your uploads, what is shared with you, and a file waiting on your
+  // decision (you can't approve what you can't read).
+  const visible = !!row && rowVisible(row, access) &&
+    (readLevel >= LEVEL_ALL || row.uploaded_by === callerId || rowShared(row, access) ||
+      (await standingOn(serviceClient, callerId, row))?.right.ok === true);
   if (!row || !visible) return jsonResponse({ error: "Document not found." }, request, 404);
 
   const { data: stored, error: storedError } = await serviceClient.from(cfg.table).select("storage_path").eq("id", documentId).maybeSingle();
@@ -468,7 +542,140 @@ async function handleUrl(serviceClient: ServiceClient, request: Request, params:
     .from(cfg.bucket)
     .createSignedUrl(String(stored.storage_path), 60, { download: String(row.file_name) });
   if (signError || !signed?.signedUrl) return internalError(request, signError, "sign document");
+  await logDocumentEvent(serviceClient, row, "opened", callerId);
   return jsonResponse({ url: signed.signedUrl, fileName: row.file_name }, request);
+}
+
+/** One file's history, every version of it, newest first. */
+async function handleHistory(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null, access: DocumentAccess) {
+  const record = params.get("record") ?? "";
+  const familyId = params.get("familyId") ?? "";
+  if (!(record in REGISTER) || !isUuid(familyId)) return jsonResponse({ error: "Invalid document." }, request, 400);
+  // Only for a file the caller can see.
+  const seen = serviceClient.from("document_register").select("id").eq("record", record).eq("family_id", familyId);
+  const { data: file, error: fileError } = await applyDocumentAccess(applyOwnScope(seen, ownUploader, access), access).limit(1);
+  if (fileError) return internalError(request, fileError, "read document");
+  if (!file?.length) return jsonResponse({ error: "Document not found." }, request, 404);
+
+  const { data, error } = await serviceClient
+    .from("document_events")
+    .select("id, action, actor, detail, created_at")
+    .eq("record", record)
+    .eq("family_id", familyId)
+    .order("created_at", { ascending: false })
+    .limit(MAX_PAGE);
+  if (error) return internalError(request, error, "document history");
+  const rows = (data ?? []) as Row[];
+  const names = await buildDisplayNameMap(serviceClient, new Set(rows.map((r) => r.actor).filter((id): id is string => typeof id === "string")));
+  return jsonResponse({
+    events: rows.map((r) => ({
+      id: r.id,
+      action: r.action,
+      // Null is the nightly clean-up, which nobody did.
+      actorDisplayName: typeof r.actor === "string" ? (names.get(r.actor) ?? "Unknown") : null,
+      detail: r.detail ?? null,
+      atUtc: r.created_at,
+    })),
+  }, request);
+}
+
+/** The disposal record: every file destroyed at the end of its retention, newest first. */
+async function handleDisposals(serviceClient: ServiceClient, request: Request, params: URLSearchParams, callerId: string) {
+  if ((await callerLevel(serviceClient, callerId, ENTITY, "delete")) < LEVEL_ALL) {
+    return jsonResponse({ error: "Only someone who can manage documents can read the disposal record." }, request, 403);
+  }
+  const offset = Math.max(0, Number.parseInt(params.get("offset") ?? "0", 10) || 0);
+  const limit = Math.min(MAX_PAGE, Math.max(1, Number.parseInt(params.get("limit") ?? "24", 10) || 24));
+  let q = serviceClient
+    .from("document_disposals")
+    .select("id, record, file_name, document_type, client_name, record_name, versions, retained_until, reason, disposed_by_name, disposed_at", { count: "exact" });
+  const search = (params.get("search") ?? "").replace(/[,()"'\\*%:]/g, " ").trim().slice(0, 100);
+  if (search) q = q.or(`file_name.ilike.*${search}*,client_name.ilike.*${search}*,record_name.ilike.*${search}*`);
+  const { data, error, count } = await q.order("disposed_at", { ascending: false }).order("id").range(offset, offset + limit - 1);
+  if (error) return internalError(request, error, "disposal record");
+  return jsonResponse({
+    disposals: ((data ?? []) as Row[]).map((d) => ({
+      id: d.id,
+      record: d.record,
+      fileName: d.file_name,
+      documentType: d.document_type,
+      clientName: d.client_name,
+      recordName: d.record_name,
+      versions: Number(d.versions ?? 1),
+      retainedUntil: d.retained_until,
+      reason: d.reason,
+      disposedByDisplayName: d.disposed_by_name,
+      disposedAtUtc: d.disposed_at,
+    })),
+    total: count ?? 0,
+  }, request);
+}
+
+/** Who may see one folder or file, and whether the caller may change that. */
+async function handleAccess(
+  serviceClient: ServiceClient,
+  request: Request,
+  params: URLSearchParams,
+  callerId: string,
+  access: DocumentAccess,
+) {
+  const folderId = params.get("folderId") ?? "";
+  const writeLevel = await callerLevel(serviceClient, callerId, ENTITY, "write");
+  let restricted = false;
+  let canEdit = false;
+  let grants;
+  let shares;
+  if (folderId) {
+    if (!isUuid(folderId)) return jsonResponse({ error: "Invalid folder." }, request, 400);
+    const { data: folder, error } = await serviceClient.from("document_folders").select("id, restricted").eq("id", folderId).maybeSingle();
+    if (error) return internalError(request, error, "read folder");
+    if (!folder || access.deniedFolders.has(folderId)) return jsonResponse({ error: "Folder not found." }, request, 404);
+    restricted = folder.restricted === true;
+    canEdit = writeLevel >= LEVEL_ALL;
+    [grants, shares] = await Promise.all([
+      serviceClient.from("document_access").select("profile_id, team_id").eq("folder_id", folderId),
+      serviceClient.from("document_shares").select("profile_id, team_id").eq("folder_id", folderId),
+    ]);
+  } else {
+    const record = params.get("record") ?? "";
+    const documentId = params.get("documentId") ?? "";
+    if (!(record in REGISTER) || !isUuid(documentId)) return jsonResponse({ error: "Invalid document." }, request, 400);
+    const { row, error } = await readRegisterRow(serviceClient, record, documentId);
+    if (error) return internalError(request, error, "read document");
+    if (!row || !rowVisible(row, access)) return jsonResponse({ error: "Document not found." }, request, 404);
+    restricted = row.restricted === true;
+    canEdit = writeLevel >= LEVEL_ALL || (writeLevel > 0 && row.uploaded_by === callerId);
+    [grants, shares] = await Promise.all([
+      serviceClient.from("document_access").select("profile_id, team_id").eq("family_id", String(row.family_id)),
+      serviceClient.from("document_shares").select("profile_id, team_id").eq("family_id", String(row.family_id)),
+    ]);
+  }
+  if (grants.error ?? shares.error) return internalError(request, grants.error ?? shares.error, "read access");
+  const idsOf = (rows: Row[], column: string) => rows.map((r) => r[column]).filter((id): id is string => typeof id === "string");
+  const named = (grants.data ?? []) as Row[];
+  const shared = (shares.data ?? []) as Row[];
+  const teamIds = [...idsOf(named, "team_id"), ...idsOf(shared, "team_id")];
+  const [names, teams] = await Promise.all([
+    buildDisplayNameMap(serviceClient, new Set([...idsOf(named, "profile_id"), ...idsOf(shared, "profile_id")])),
+    teamIds.length > 0
+      ? serviceClient.from("teams").select("id, name").in("id", teamIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (teams.error) return internalError(request, teams.error, "read teams");
+  const teamNames = new Map(((teams.data ?? []) as Row[]).map((t) => [String(t.id), String(t.name)]));
+  const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
+  const people = (rows: Row[]) => idsOf(rows, "profile_id").map((id) => ({ id, name: names.get(id) ?? "Unknown" })).sort(byName);
+  const teamsOf = (rows: Row[]) => idsOf(rows, "team_id").map((id) => ({ id, name: teamNames.get(id) ?? "Unknown" })).sort(byName);
+  return jsonResponse({
+    access: {
+      restricted,
+      people: people(named),
+      teams: teamsOf(named),
+      sharedPeople: people(shared),
+      sharedTeams: teamsOf(shared),
+      canEdit,
+    },
+  }, request);
 }
 
 // ---------------------------------------------------------------- mutations
@@ -478,6 +685,8 @@ interface MutationContext {
   callerId: string;
   request: Request;
   payload: Record<string, unknown>;
+  caller: CallerTeams;
+  access: DocumentAccess;
 }
 
 /** The file a mutation names, or the response that refuses it. */
@@ -487,7 +696,8 @@ async function namedFile(ctx: MutationContext): Promise<{ row: Row; table: strin
   if (!(record in REGISTER) || !isUuid(documentId)) return jsonResponse({ error: "Invalid document." }, ctx.request, 400);
   const { row, error } = await readRegisterRow(ctx.serviceClient, record, documentId);
   if (error) return internalError(ctx.request, error, "read document");
-  if (!row) return jsonResponse({ error: "Document not found." }, ctx.request, 404);
+  // A restricted file the caller isn't named for reads as not there.
+  if (!row || !rowVisible(row, ctx.access)) return jsonResponse({ error: "Document not found." }, ctx.request, 404);
   return { row, table: REGISTER[record].table };
 }
 
@@ -539,6 +749,7 @@ async function handleSubmit(ctx: MutationContext): Promise<Response> {
     .select("id");
   if (error) return internalError(request, error, "submit document");
   if (!data?.length) return jsonResponse({ error: "This file's approval changed just now. Reload and try again." }, request, 409);
+  await logDocumentEvent(serviceClient, row, "submitted", callerId);
   return jsonResponse({ message: "Sent for approval." }, request);
 }
 
@@ -586,7 +797,10 @@ async function handleDecide(ctx: MutationContext): Promise<Response> {
     const { data: given, error: givenError } = await serviceClient.from("document_approvals").select("profile_id").match(fileApprovals);
     if (givenError) return internalError(request, givenError, "read approvals");
     const waitingOn = outstandingApprovers(routing.pool, ((given ?? []) as Row[]).map((a) => String(a.profile_id)));
-    if (waitingOn.length > 0 && !forGroup) return jsonResponse({ message: "Approval recorded.", waitingOn: waitingOn.length }, request);
+    if (waitingOn.length > 0 && !forGroup) {
+      await logDocumentEvent(serviceClient, row, "approval_recorded", callerId, `${waitingOn.length} still to approve`);
+      return jsonResponse({ message: "Approval recorded.", waitingOn: waitingOn.length }, request);
+    }
     settledForGroup = waitingOn.length > 0;
     actingFor = givesFor !== null && givesFor !== callerId ? givesFor : null;
   }
@@ -616,6 +830,7 @@ async function handleDecide(ctx: MutationContext): Promise<Response> {
   if (!data?.length) return jsonResponse({ error: "Someone else decided this file just now." }, request, 409);
   // Sent back: the approvals given so far don't carry to the next round.
   if (decision === "sent_back") await serviceClient.from("document_approvals").delete().match(fileApprovals);
+  await logDocumentEvent(serviceClient, row, decision === "approved" ? "approved" : "sent_back", callerId, comment || null);
   return jsonResponse({ message: decision === "approved" ? "Approved." : "Sent back." }, request);
 }
 
@@ -633,7 +848,85 @@ async function handleSetHold(ctx: MutationContext): Promise<Response> {
     .update({ on_hold: payload.onHold, hold_by: payload.onHold ? callerId : null, hold_at: payload.onHold ? new Date().toISOString() : null })
     .eq("id", file.row.id);
   if (error) return internalError(request, error, "hold document");
+  await logDocumentEvent(serviceClient, file.row, payload.onHold ? "hold_set" : "hold_lifted", callerId);
   return jsonResponse({ message: payload.onHold ? "On hold." : "Hold lifted." }, request);
+}
+
+// ---------------------------------------------------------------- end of retention
+
+/** A file past its retention is reviewed by whoever manages documents. Null to proceed. */
+async function retentionReviewerRefusal(ctx: MutationContext): Promise<Response | null> {
+  if ((await callerLevel(ctx.serviceClient, ctx.callerId, ENTITY, "delete")) >= LEVEL_ALL) return null;
+  return jsonResponse({ error: "Only someone who can manage documents can dispose of a file or extend its retention." }, ctx.request, 403);
+}
+
+/**
+ * POST { record, documentId, reason }: destroy a file whose retention has run
+ * out, every version with it, and keep a line saying so for good.
+ */
+async function handleDispose(ctx: MutationContext): Promise<Response> {
+  const { serviceClient, callerId, request, payload } = ctx;
+  const refused = await retentionReviewerRefusal(ctx);
+  if (refused) return refused;
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  if (!reason) return jsonResponse({ error: "Say why this file is being disposed of. The reason is kept on the disposal record." }, request, 400);
+  if (reason.length > MAX_DISPOSAL_REASON) {
+    return jsonResponse({ error: `The reason must be ${MAX_DISPOSAL_REASON} characters or fewer.` }, request, 400);
+  }
+  const file = await namedFile(ctx);
+  if (file instanceof Response) return file;
+  const { row, table } = file;
+
+  const versions = await serviceClient.from(table).select("on_hold, retain_until").eq("family_id", row.family_id);
+  if (versions.error) return internalError(request, versions.error, "read document versions");
+  const kept = (v: Row) => ({ onHold: v.on_hold === true, retainUntil: typeof v.retain_until === "string" ? v.retain_until : null });
+  const refusal = disposalRefusal(
+    { ...kept(row), archived: !!row.archived_at, isLatest: row.is_latest === true },
+    ((versions.data ?? []) as Row[]).map(kept),
+    await orgToday(serviceClient),
+  );
+  if (refusal) return jsonResponse({ error: refusal }, request, 400);
+
+  const names = await buildDisplayNameMap(serviceClient, new Set([callerId]));
+  // The rows and the disposal line go together; the database still refuses a held or retained version.
+  const { data: paths, error } = await serviceClient.rpc("dispose_document_family", {
+    p_record: row.record,
+    p_family_id: row.family_id,
+    p_file_name: row.file_name,
+    p_document_type: row.document_type,
+    p_client_name: row.client_name,
+    p_record_name: row.record_name,
+    p_retained_until: row.retain_until,
+    p_reason: reason,
+    p_by: callerId,
+    p_by_name: names.get(callerId) ?? "Unknown",
+  });
+  if (error) return internalError(request, error, "dispose of document");
+  // A leftover object is invisible; the rows that pointed at it are gone.
+  const { error: storageError } = await serviceClient.storage.from(REGISTER[String(row.record)].bucket).remove((paths ?? []) as string[]);
+  if (storageError) console.error("dispose of document: stored file left behind", storageError.message);
+  await logDocumentEvent(serviceClient, row, "disposed", callerId, reason);
+  return jsonResponse({ message: "Document disposed of." }, request);
+}
+
+/** POST { record, documentId, retainUntil }: keep a file longer than its category said. */
+async function handleExtendRetention(ctx: MutationContext): Promise<Response> {
+  const { serviceClient, callerId, request, payload } = ctx;
+  const refused = await retentionReviewerRefusal(ctx);
+  if (refused) return refused;
+  const file = await namedFile(ctx);
+  if (file instanceof Response) return file;
+  const { row, table } = file;
+  const refusal = extensionRefusal(
+    { archived: !!row.archived_at, retainUntil: typeof row.retain_until === "string" ? row.retain_until : null },
+    payload.retainUntil,
+    await orgToday(serviceClient),
+  );
+  if (refusal) return jsonResponse({ error: refusal }, request, 400);
+  const { error } = await serviceClient.from(table).update({ retain_until: payload.retainUntil }).eq("id", row.id);
+  if (error) return internalError(request, error, "extend retention");
+  await logDocumentEvent(serviceClient, row, "retention_extended", callerId, `From ${row.retain_until} to ${payload.retainUntil}`);
+  return jsonResponse({ message: "Retention extended." }, request);
 }
 
 // ---------------------------------------------------------------- folders
@@ -650,7 +943,7 @@ async function namedFolder(ctx: MutationContext, id: unknown): Promise<Row | Res
   const { data, error } = await ctx.serviceClient
     .from("document_folders").select("id, client_id, engagement_id, parent_id, name").eq("id", id).maybeSingle();
   if (error) return internalError(ctx.request, error, "read folder");
-  if (!data) return jsonResponse({ error: "Folder not found." }, ctx.request, 404);
+  if (!data || ctx.access.deniedFolders.has(id)) return jsonResponse({ error: "Folder not found." }, ctx.request, 404);
   return data as Row;
 }
 
@@ -726,29 +1019,239 @@ async function handleDeleteFolder(ctx: MutationContext): Promise<Response> {
   return jsonResponse({ message: "Folder deleted." }, request);
 }
 
-/** POST { record, documentId, folderId | null }: move a file, every version
- *  with it, into a folder of its own record, or back onto the record. */
+/** The client or engagement a file is moving to, if the caller may add to it. */
+async function fileableTarget(ctx: MutationContext, record: string, id: string): Promise<{ name: string } | Response> {
+  const { serviceClient, callerId, request } = ctx;
+  const who = await moverOf(serviceClient, callerId, ctx.caller);
+  if (record === "client") {
+    const { data, error } = await serviceClient.from("clients").select("name, created_by, archived_at").eq("id", id).maybeSingle();
+    if (error) return internalError(request, error, "read client");
+    if (!data) return jsonResponse({ error: "Client not found." }, request, 404);
+    if (data.archived_at) return jsonResponse({ error: "That client is archived." }, request, 400);
+    if (!mayFileOnClient(who, typeof data.created_by === "string" ? data.created_by : null)) {
+      return jsonResponse({ error: "You cannot add files to that client." }, request, 403);
+    }
+    return { name: String(data.name) };
+  }
+  const { data, error } = await serviceClient.from("engagements").select("name, team_id, archived_at, clients(archived_at)").eq("id", id).maybeSingle();
+  if (error) return internalError(request, error, "read engagement");
+  if (!data) return jsonResponse({ error: "Engagement not found." }, request, 404);
+  if (data.archived_at || (data.clients as Row | null)?.archived_at) return jsonResponse({ error: "That engagement is archived." }, request, 400);
+  if (!mayFileOnEngagement(who, String(data.team_id))) return jsonResponse({ error: "You cannot add files to that engagement." }, request, 403);
+  return { name: String(data.name) };
+}
+
+/**
+ * POST { record, documentId, folderId | null, to?: { record, recordId } }:
+ * move a file, every version with it. Without `to` it stays on its record and
+ * only changes folder. With one it goes to another client or engagement the
+ * caller may add to, and its approval starts again there.
+ */
 async function handleMoveDocument(ctx: MutationContext): Promise<Response> {
   const { serviceClient, callerId, request, payload } = ctx;
   const perm = await requirePermission(serviceClient, callerId, ENTITY, "write");
   if (!perm.ok) return jsonResponse({ error: perm.error }, request, perm.status);
   const file = await namedFile(ctx);
   if (file instanceof Response) return file;
-  if (perm.level < LEVEL_ALL && file.row.uploaded_by !== callerId) {
+  const { row } = file;
+  if (perm.level < LEVEL_ALL && row.uploaded_by !== callerId) {
     return jsonResponse({ error: "You can only move files you uploaded." }, request, 403);
   }
+  const fromRecord = String(row.record);
+  const to = payload.to && typeof payload.to === "object" ? payload.to as Row : null;
+  const toRecord = to ? String(to.record) : fromRecord;
+  const toId = to ? String(to.recordId) : String(row.record_id);
+  if (!(toRecord in REGISTER) || !isUuid(toId)) return jsonResponse({ error: "Invalid destination." }, request, 400);
+
   let folderId: string | null = null;
+  let folderName: string | null = null;
   if (payload.folderId !== null && payload.folderId !== undefined) {
     const folder = await namedFolder(ctx, payload.folderId);
     if (folder instanceof Response) return folder;
-    if (folder[folderOwner(String(file.row.record))] !== file.row.record_id) {
-      return jsonResponse({ error: "A file can only move to a folder of its own record." }, request, 400);
+    if (folder[folderOwner(toRecord)] !== toId) {
+      return jsonResponse({ error: "That folder is not on the place the file is going to." }, request, 400);
     }
     folderId = String(folder.id);
+    folderName = String(folder.name);
   }
-  const { error } = await serviceClient.from(file.table).update({ folder_id: folderId }).eq("family_id", file.row.family_id);
-  if (error) return internalError(request, error, "move document");
+
+  // Staying on its record, only the folder changes.
+  if (toRecord === fromRecord && toId === row.record_id) {
+    const { error } = await serviceClient.from(file.table).update({ folder_id: folderId }).eq("family_id", row.family_id);
+    if (error) return internalError(request, error, "move document");
+    await logDocumentEvent(serviceClient, row, "moved", callerId, folderName ? `To ${folderName}` : "Out of its folder");
+    return jsonResponse({ message: "Document moved." }, request);
+  }
+
+  const today = appToday(new Date(), (await loadOrgLocale(serviceClient)).timeZone);
+  const stuck = leaveRefusal(
+    { archived: !!row.archived_at, onHold: row.on_hold === true, retainUntil: typeof row.retain_until === "string" ? row.retain_until : null },
+    today,
+  );
+  if (stuck) return jsonResponse({ error: stuck }, request, 400);
+  const target = await fileableTarget(ctx, toRecord, toId);
+  if (target instanceof Response) return target;
+  let offered: readonly string[];
+  try {
+    offered = (await allowedDocumentTypes(serviceClient, toRecord as DocumentRecord, toId)).types;
+  } catch (typesError) {
+    return internalError(request, typesError, "read document categories");
+  }
+  if (!offered.includes(String(row.document_type))) {
+    return jsonResponse({ error: `${row.document_type} is not a category offered on ${target.name}. Change the file's category first, then move it.` }, request, 400);
+  }
+
+  // A client's files and an engagement's are kept in different buckets, so
+  // the stored versions go across first and come back if the rows don't follow.
+  const source = REGISTER[fromRecord];
+  const dest = REGISTER[toRecord];
+  const crossed: string[] = [];
+  const putBack = async () => {
+    for (const path of crossed) {
+      const { error } = await serviceClient.storage.from(dest.bucket).move(path, path, { destinationBucket: source.bucket });
+      if (error) console.error("move document: could not put back", path, error.message);
+    }
+  };
+  if (source.bucket !== dest.bucket) {
+    const versions = await serviceClient.from(source.table).select("storage_path").eq("family_id", row.family_id);
+    if (versions.error) return internalError(request, versions.error, "read document versions");
+    for (const version of (versions.data ?? []) as Row[]) {
+      const path = String(version.storage_path);
+      const { error } = await serviceClient.storage.from(source.bucket).move(path, path, { destinationBucket: dest.bucket });
+      if (error) {
+        await putBack();
+        return internalError(request, error, "move stored file");
+      }
+      crossed.push(path);
+    }
+  }
+  const { error } = await serviceClient.rpc("move_document_family", {
+    p_family: row.family_id,
+    p_from: fromRecord,
+    p_to: toRecord,
+    p_to_id: toId,
+    p_folder: folderId,
+  });
+  if (error) {
+    await putBack();
+    return internalError(request, error, "move document");
+  }
+  await logDocumentEvent(
+    serviceClient,
+    { ...row, record: toRecord },
+    "moved",
+    callerId,
+    `From ${row.record_name} to ${target.name}${folderName ? `, ${folderName}` : ""}. Approval starts again.`,
+  );
   return jsonResponse({ message: "Document moved." }, request);
+}
+
+/**
+ * POST { folderId } or { record, documentId }, with { restricted, personIds,
+ * teamIds } and/or { shared: { personIds, teamIds } }: who may see a folder
+ * or a file, and who it is shared with. A part not sent is unchanged. Folders
+ * are for whoever may change every document; a file also for its uploader.
+ * Whoever restricts it keeps their own way in.
+ */
+async function handleSetAccess(ctx: MutationContext): Promise<Response> {
+  const { serviceClient, callerId, request, payload } = ctx;
+  const restricting = payload.restricted !== undefined;
+  const sharing = payload.shared && typeof payload.shared === "object" ? payload.shared as Row : null;
+  if (!restricting && !sharing) return jsonResponse({ error: "Nothing to save." }, request, 400);
+  if (restricting && typeof payload.restricted !== "boolean") return jsonResponse({ error: "restricted must be true or false." }, request, 400);
+  const personIds = restricting && payload.restricted ? idList(payload.personIds) : [];
+  const teamIds = restricting && payload.restricted ? idList(payload.teamIds) : [];
+  const sharedPersonIds = sharing ? idList(sharing.personIds) : [];
+  const sharedTeamIds = sharing ? idList(sharing.teamIds) : [];
+  if (!personIds || !teamIds || !sharedPersonIds || !sharedTeamIds) return jsonResponse({ error: "People and teams must be lists." }, request, 400);
+  if ([personIds, teamIds, sharedPersonIds, sharedTeamIds].some((ids) => ids.length > MAX_PAGE)) {
+    return jsonResponse({ error: "That is too many people or teams." }, request, 400);
+  }
+  const writeLevel = await callerLevel(serviceClient, callerId, ENTITY, "write");
+
+  let folderId: string | null = null;
+  let file: { row: Row; table: string } | null = null;
+  if (payload.folderId !== undefined && payload.folderId !== null) {
+    if (writeLevel < LEVEL_ALL) return jsonResponse({ error: "Only someone who can change every document can restrict a folder." }, request, 403);
+    const folder = await namedFolder(ctx, payload.folderId);
+    if (folder instanceof Response) return folder;
+    folderId = String(folder.id);
+  } else {
+    const named = await namedFile(ctx);
+    if (named instanceof Response) return named;
+    if (writeLevel < LEVEL_ALL && !(writeLevel > 0 && named.row.uploaded_by === callerId)) {
+      return jsonResponse({ error: "You can only restrict files you uploaded." }, request, 403);
+    }
+    file = named;
+  }
+
+  // Everyone and every team named, in either list, has to be there.
+  const everyone = [...new Set([...personIds, ...sharedPersonIds])];
+  const everyTeam = [...new Set([...teamIds, ...sharedTeamIds])];
+  const [people, teams] = await Promise.all([
+    everyone.length > 0
+      ? serviceClient.from("profiles").select("id").in("id", everyone).eq("status", "active")
+      : Promise.resolve({ data: [], error: null }),
+    everyTeam.length > 0 ? serviceClient.from("teams").select("id").in("id", everyTeam) : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (people.error ?? teams.error) return internalError(request, people.error ?? teams.error, "read people and teams");
+  if ((people.data ?? []).length !== everyone.length) return jsonResponse({ error: "Everyone named must be an active person." }, request, 400);
+  if ((teams.data ?? []).length !== everyTeam.length) return jsonResponse({ error: "One of those teams no longer exists." }, request, 400);
+
+  const familyId = file ? String(file.row.family_id) : null;
+  const changes: string[] = [];
+  if (restricting) {
+    const { error } = await serviceClient.rpc("replace_document_access", {
+      p_folder_id: folderId,
+      p_record: file ? String(file.row.record) : null,
+      p_family_id: familyId,
+      p_restricted: payload.restricted,
+      p_profile_ids: payload.restricted ? accessPeople(personIds, callerId, ctx.caller.globalAdmin) : [],
+      p_team_ids: teamIds,
+    });
+    if (error) return internalError(request, error, "save access");
+    changes.push(payload.restricted ? "Restricted to named people and teams" : "Restriction lifted");
+  }
+  if (sharing) {
+    const { error } = await serviceClient.rpc("replace_document_shares", {
+      p_folder_id: folderId,
+      p_family_id: familyId,
+      p_profile_ids: sharedPersonIds,
+      p_team_ids: sharedTeamIds,
+    });
+    if (error) return internalError(request, error, "save sharing");
+    changes.push(shareSummary(sharedPersonIds.length, sharedTeamIds.length));
+  }
+  if (file) await logDocumentEvent(serviceClient, file.row, "access_changed", callerId, changes.join(". "));
+  return jsonResponse({ message: "Access saved." }, request);
+}
+
+/** POST { record, recordId }: give a client or engagement the folders of its
+ *  template, leaving the folders it has. */
+async function handleApplyTemplate(ctx: MutationContext): Promise<Response> {
+  const { serviceClient, callerId, request, payload } = ctx;
+  const refused = await folderKeeperRefusal(ctx);
+  if (refused) return refused;
+  const record = typeof payload.record === "string" ? payload.record : "";
+  const recordId = typeof payload.recordId === "string" ? payload.recordId : "";
+  if ((record !== "client" && record !== "engagement") || !isUuid(recordId)) return jsonResponse({ error: "Invalid record." }, request, 400);
+
+  const { data: found, error } = record === "engagement"
+    ? await serviceClient.from("engagements").select("id, team_id, engagement_type_id").eq("id", recordId).maybeSingle()
+    : await serviceClient.from("clients").select("id").eq("id", recordId).maybeSingle();
+  if (error) return internalError(request, error, "read record");
+  if (!found) return jsonResponse({ error: "Record not found." }, request, 404);
+  const of = found as Row;
+  try {
+    const made = await addTemplateFolders(serviceClient, record, recordId, callerId, {
+      teamId: typeof of.team_id === "string" ? of.team_id : null,
+      engagementTypeId: typeof of.engagement_type_id === "string" ? of.engagement_type_id : null,
+    });
+    if (made === null) return jsonResponse({ error: "There is no folder template for this. Add one in Settings, under Folder Templates." }, request, 400);
+    return jsonResponse({ message: made === 0 ? "It already has every folder of its template." : "Folders added.", created: made }, request);
+  } catch (applyError) {
+    return internalError(request, applyError, "apply folder template");
+  }
 }
 
 // Each action and its handler. Every one checks its own grant, because they
@@ -758,10 +1261,14 @@ const MUTATIONS: Record<string, (ctx: MutationContext) => Promise<Response>> = {
   submit: handleSubmit,
   decide: handleDecide,
   set_hold: handleSetHold,
+  dispose: handleDispose,
+  extend_retention: handleExtendRetention,
   create_folder: handleCreateFolder,
   rename_folder: handleRenameFolder,
   delete_folder: handleDeleteFolder,
   move_document: handleMoveDocument,
+  set_access: handleSetAccess,
+  apply_folder_template: handleApplyTemplate,
 };
 
 Deno.serve((request) =>
@@ -774,19 +1281,27 @@ Deno.serve((request) =>
       const params = new URL(request.url).searchParams;
       // Own: the files you uploaded.
       const ownUploader = perm.level === LEVEL_OWN ? callerId : null;
+      // What the caller may see of the restricted folders and files, for every read below.
+      const caller = await callerTeams(serviceClient, callerId);
+      const access = await loadDocumentAccess(serviceClient, callerId, caller);
       const action = params.get("action") ?? "list";
+      if (action === "move_targets") return handleMoveTargets(serviceClient, request, callerId, caller);
       if (action === "list" && params.get("removed") === "true") {
         const scope = binScope(perm.level, await callerLevel(serviceClient, callerId, ENTITY, "delete"), callerId);
         if (!scope.ok) return jsonResponse({ error: scope.error }, request, 403);
-        return handleList(serviceClient, request, params, scope.uploader, true);
+        return handleList(serviceClient, request, params, scope.uploader, access, true);
       }
-      if (action === "list") return handleList(serviceClient, request, params, ownUploader);
-      if (action === "facets") return handleFacets(serviceClient, request, ownUploader);
-      if (action === "folders") return handleFolders(serviceClient, request, params);
-      if (action === "versions") return handleVersions(serviceClient, request, params, ownUploader);
-      if (action === "dashboard") return handleDashboard(serviceClient, request, callerId, ownUploader);
-      if (action === "approval") return handleApproval(serviceClient, request, params, callerId, perm.level);
-      if (action === "document_url") return handleUrl(serviceClient, request, params, callerId, perm.level);
+      if (action === "list") return handleList(serviceClient, request, params, ownUploader, access);
+      if (action === "facets") return handleFacets(serviceClient, request, ownUploader, access);
+      if (action === "folders") return handleFolders(serviceClient, request, params, access);
+      if (action === "all_folders") return handleAllFolders(serviceClient, request, access);
+      if (action === "versions") return handleVersions(serviceClient, request, params, ownUploader, access);
+      if (action === "dashboard") return handleDashboard(serviceClient, request, callerId, ownUploader, access);
+      if (action === "approval") return handleApproval(serviceClient, request, params, callerId, perm.level, access);
+      if (action === "document_url") return handleUrl(serviceClient, request, params, callerId, perm.level, access);
+      if (action === "history") return handleHistory(serviceClient, request, params, ownUploader, access);
+      if (action === "access") return handleAccess(serviceClient, request, params, callerId, access);
+      if (action === "disposals") return handleDisposals(serviceClient, request, params, callerId);
       return jsonResponse({ error: `Unknown action: ${action}` }, request, 400);
     }
 
@@ -803,5 +1318,6 @@ Deno.serve((request) =>
     const action = typeof payload.action === "string" ? payload.action : "";
     const handler = MUTATIONS[action];
     if (!handler) return jsonResponse({ error: `Unknown action: ${action}` }, request, 400);
-    return handler({ serviceClient, callerId, request, payload });
+    const caller = await callerTeams(serviceClient, callerId);
+    return handler({ serviceClient, callerId, request, payload, caller, access: await loadDocumentAccess(serviceClient, callerId, caller) });
   }));

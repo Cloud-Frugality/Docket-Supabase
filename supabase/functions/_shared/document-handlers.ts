@@ -10,14 +10,18 @@
 import { internalError, jsonResponse } from "./http.ts";
 import { isUuid } from "./validation.ts";
 import { documentStoragePath, validateDocument } from "./documents.ts";
+import { storedUploadRules, type UploadRules } from "./upload-rules.ts";
+import { inspectFile, parseChecksOff } from "./file-inspection.ts";
 import { buildDisplayNameMap } from "./display-names.ts";
-import { callerLevel, LEVEL_ALL, LEVEL_OWN } from "./permissions.ts";
+import { callerLevel, callerTeams, LEVEL_ALL, LEVEL_OWN } from "./permissions.ts";
 import { legacyMetadata, parseDocumentMetadata, removalRefusal, type DocumentRecord } from "./document-rules.ts";
 import { retentionRefusal } from "./file-approval.ts";
 import { allowedDocumentTypes } from "./document-categories.ts";
 import { appToday } from "./app-date.ts";
 import { loadOrgLocale } from "./organisation-locale.ts";
 import type { ServiceClient } from "./service-client.ts";
+import { loadDocumentAccess, rowVisible } from "./document-access-load.ts";
+import { logDocumentEvent } from "./document-events-log.ts";
 
 export interface DocumentAccessDenial {
   error: string;
@@ -53,7 +57,7 @@ const DOCUMENT_COLUMNS =
   "id, file_name, content_type, size_bytes, storage_path, uploaded_by, created_at, document_type, status, reference, effective_from, effective_to, note, family_id, version, archived_at";
 // Client and engagement files are approved, held and retained; a feature
 // request's attachments are not.
-const APPROVAL_COLUMNS = ", approval_state, on_hold, retain_until";
+const APPROVAL_COLUMNS = ", approval_state, on_hold, retain_until, folder_id, restricted, custom";
 const columnsFor = (cfg: Pick<DocumentEntityConfig, "record">) =>
   cfg.record === "feature_request" ? DOCUMENT_COLUMNS : DOCUMENT_COLUMNS + APPROVAL_COLUMNS;
 
@@ -97,8 +101,22 @@ async function readDocument(
     .select(`${columnsFor(cfg)}, ${cfg.idColumn}`)
     .eq("id", documentId)
     .maybeSingle();
-  return { doc: (data as DocumentRow | null) ?? null, error };
+  if (error || !data) return { doc: null, error };
+  // A restricted file the caller isn't named for reads as not there, for every handler below.
+  if (cfg.record !== "feature_request") {
+    const access = await loadDocumentAccess(ctx.serviceClient, ctx.callerId, await callerTeams(ctx.serviceClient, ctx.callerId));
+    if (!rowVisible(data as Record<string, unknown>, access)) return { doc: null, error: null };
+  }
+  return { doc: data as DocumentRow, error: null };
 }
+
+/** The file as its history names it. */
+const historyOf = (cfg: Pick<DocumentEntityConfig, "record">, doc: Record<string, unknown>) => ({
+  record: cfg.record,
+  id: doc.id,
+  family_id: doc.family_id,
+  file_name: doc.file_name,
+});
 
 /** GET ?entityId= every file on the record, newest first, removed ones
  *  included and flagged. Each row says whether this caller may remove it, so
@@ -127,7 +145,11 @@ export async function handleListDocuments(
 
   if (error) return internalError(request, error, `list ${cfg.entityLabel} documents`);
 
-  const rows = (data ?? []) as unknown as DocumentRow[];
+  let rows = (data ?? []) as unknown as DocumentRow[];
+  if (cfg.record !== "feature_request") {
+    const access = await loadDocumentAccess(ctx.serviceClient, ctx.callerId, await callerTeams(ctx.serviceClient, ctx.callerId));
+    rows = rows.filter((row) => rowVisible(row, access));
+  }
   const uploaderIds = new Set(
     rows.map((r) => r.uploaded_by).filter((id): id is string => typeof id === "string" && !!id),
   );
@@ -168,6 +190,8 @@ export async function handleListDocuments(
           effectiveFrom: row.effective_from ?? null,
           effectiveTo: row.effective_to ?? null,
           note: row.note ?? null,
+          custom: row.custom && typeof row.custom === "object" ? row.custom : {},
+          restricted: row.restricted === true,
           familyId: row.family_id,
           version: Number(row.version ?? 1),
           archivedAtUtc: row.archived_at,
@@ -214,7 +238,20 @@ export async function handleDocumentUrl(
   if (signError || !signed?.signedUrl) {
     return internalError(request, signError, `sign ${cfg.entityLabel} document`);
   }
+  await logDocumentEvent(ctx.serviceClient, historyOf(cfg, doc), "opened", ctx.callerId);
   return jsonResponse({ url: signed.signedUrl, fileName: doc.file_name }, request);
+}
+
+/**
+ * The kinds of file and the size the organisation allows, and the checks on
+ * an upload it has switched off. Read on each upload, so a change takes hold
+ * at once.
+ */
+async function uploadRules(serviceClient: ServiceClient): Promise<UploadRules & { checksOff: string[] }> {
+  const { data, error } = await serviceClient
+    .from("organisations").select("upload_types, upload_max_mb, upload_checks_off").order("created_at").limit(1).maybeSingle();
+  if (error) throw error;
+  return { ...storedUploadRules(data?.upload_types, data?.upload_max_mb), checksOff: parseChecksOff(data?.upload_checks_off) ?? [] };
 }
 
 /** POST { entityId, fileName, contentType, sizeBytes }: validates, then mints
@@ -234,7 +271,7 @@ export async function handleDocumentUploadUrl(
     return jsonResponse({ error: "Invalid entityId." }, request, 400);
   }
 
-  const invalid = validateDocument({ fileName, contentType, sizeBytes });
+  const invalid = validateDocument({ fileName, contentType, sizeBytes }, await uploadRules(ctx.serviceClient));
   if (invalid) return jsonResponse({ error: invalid }, request, 400);
 
   const denied = await cfg.checkAccess(entityId, "write");
@@ -283,7 +320,8 @@ export async function handleRegisterDocument(
     return jsonResponse({ error: "Invalid versionOf." }, request, 400);
   }
 
-  const invalid = validateDocument({ fileName, contentType, sizeBytes: claimedSize });
+  const rules = await uploadRules(serviceClient);
+  const invalid = validateDocument({ fileName, contentType, sizeBytes: claimedSize }, rules);
   if (invalid) return jsonResponse({ error: invalid }, request, 400);
 
   // No details sent: file it as Other / Final so older callers still upload.
@@ -297,6 +335,22 @@ export async function handleRegisterDocument(
 
   const denied = await cfg.checkAccess(entityId, "write");
   if (denied) return jsonResponse({ error: denied.error }, request, denied.status);
+
+  // A new file can go straight into a folder of its record. A new version
+  // stays where the file already is.
+  let folderId: string | null = null;
+  if (payload.folderId && !versionOf && (cfg.record === "client" || cfg.record === "engagement")) {
+    const named = typeof payload.folderId === "string" ? payload.folderId : "";
+    if (!isUuid(named)) return jsonResponse({ error: "Invalid folder." }, request, 400);
+    const { data: folder, error: folderError } = await serviceClient
+      .from("document_folders").select("id, client_id, engagement_id").eq("id", named).maybeSingle();
+    if (folderError) return internalError(request, folderError, "read folder");
+    const access = await loadDocumentAccess(serviceClient, callerId, await callerTeams(serviceClient, callerId));
+    const onRecord = folder && (cfg.record === "client" ? folder.client_id : folder.engagement_id) === entityId;
+    // A restricted folder the caller isn't named for reads as not there.
+    if (!onRecord || access.deniedFolders.has(named)) return jsonResponse({ error: "That folder is not on this record." }, request, 400);
+    folderId = named;
+  }
 
   // A new version joins the family of the file it replaces, one above that
   // family's highest version (removed versions included, so a number is never
@@ -331,6 +385,18 @@ export async function handleRegisterDocument(
   if (!object) {
     return jsonResponse({ error: "That file has not finished uploading. Try again." }, request, 400);
   }
+  // What actually arrived is opened and checked before it is filed: it has to
+  // be the kind its name says, with nothing in it that runs. The organisation
+  // can switch each check off.
+  const { data: stored, error: readError } = await serviceClient.storage.from(cfg.bucket).download(path);
+  if (readError || !stored) return internalError(request, readError, `read ${cfg.entityLabel} document`);
+  const refusal = await inspectFile(new Uint8Array(await stored.arrayBuffer()), fileName, rules.checksOff);
+  if (refusal) {
+    await serviceClient.storage.from(cfg.bucket).remove([path]);
+    console.warn("upload refused on inspection", cfg.record, entityId, callerId, refusal);
+    return jsonResponse({ error: refusal }, request, 400);
+  }
+
   const storedSize = Number(
     (object as { metadata?: { size?: unknown; contentLength?: unknown } }).metadata?.size ??
       (object as { metadata?: { size?: unknown; contentLength?: unknown } }).metadata?.contentLength ??
@@ -353,9 +419,11 @@ export async function handleRegisterDocument(
       effective_from: m.effectiveFrom,
       effective_to: m.effectiveTo,
       note: m.note,
+      ...(cfg.record === "feature_request" ? {} : { custom: m.custom }),
       ...(family ? { family_id: family.familyId, version: family.version } : {}),
+      ...(folderId ? { folder_id: folderId } : {}),
     })
-    .select("id")
+    .select("id, family_id")
     .single();
 
   if (insertError || !inserted?.id) {
@@ -368,7 +436,13 @@ export async function handleRegisterDocument(
     }
     return internalError(request, insertError, `${cfg.entityLabel} document insert`);
   }
-
+  await logDocumentEvent(
+    serviceClient,
+    { record: cfg.record, id: inserted.id, family_id: inserted.family_id, file_name: fileName },
+    family ? "version_added" : "uploaded",
+    callerId,
+    family ? `Version ${family.version}` : null,
+  );
 
   return jsonResponse({ message: "Document attached.", id: inserted.id }, request);
 }
@@ -436,12 +510,20 @@ export async function updateDocumentMetadata(
       effective_from: m.effectiveFrom,
       effective_to: m.effectiveTo,
       note: m.note,
+      ...(cfg.record === "feature_request" ? {} : { custom: m.custom }),
       updated_at: new Date().toISOString(),
       updated_by: ctx.callerId,
     })
     .eq("id", doc.id);
   if (error) return internalError(request, error, `update ${cfg.entityLabel} document`);
-
+  await logDocumentEvent(
+    ctx.serviceClient,
+    historyOf(cfg, doc),
+    "details_changed",
+    ctx.callerId,
+    // The status is the change people look for; the rest is in the details.
+    m.status !== doc.status ? `Status: ${doc.status} to ${m.status}` : null,
+  );
 
   return jsonResponse({ message: "Document updated." }, request);
 }
@@ -512,7 +594,7 @@ export async function handleDeleteDocument(
     .update({ archived_at: new Date().toISOString(), archived_by: callerId })
     .eq("id", documentId);
   if (archiveError) return internalError(request, archiveError, `remove ${cfg.entityLabel} document`);
-
+  await logDocumentEvent(serviceClient, historyOf(cfg, doc), "removed", callerId);
 
   return jsonResponse({ message: "Document removed." }, request);
 }
@@ -544,7 +626,7 @@ export async function handleRestoreDocument(
     .update({ archived_at: null, archived_by: null })
     .eq("id", documentId);
   if (restoreError) return internalError(request, restoreError, `restore ${cfg.entityLabel} document`);
-
+  await logDocumentEvent(ctx.serviceClient, historyOf(cfg, doc), "restored", ctx.callerId);
 
   return jsonResponse({ message: "Document restored." }, request);
 }
@@ -582,7 +664,7 @@ export async function handlePurgeDocument(
   const { error: deleteError } = await ctx.serviceClient.from(cfg.table).delete().eq("id", documentId);
   if (deleteError) return internalError(request, deleteError, `delete ${cfg.entityLabel} document`);
   await ctx.serviceClient.storage.from(cfg.bucket).remove([doc.storage_path]);
-
+  await logDocumentEvent(ctx.serviceClient, historyOf(cfg, doc), "deleted", ctx.callerId);
 
   return jsonResponse({ message: "Document deleted." }, request);
 }
