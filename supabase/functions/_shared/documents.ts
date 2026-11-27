@@ -36,6 +36,10 @@ export function validateDocument(
 ): string | null {
   if (!doc.fileName || !doc.fileName.trim()) return "A file name is required.";
   if (doc.fileName.length > 255) return "That file name is too long.";
+  // The name is used as-is when the file is saved on someone's computer, so it must be one plain name.
+  if (/[\\/:*?"<>|]/.test(doc.fileName) || [...doc.fileName].some((c) => c.charCodeAt(0) < 32)) {
+    return 'That file name has a character that cannot be used (\\ / : * ? " < > |). Rename the file and try again.';
+  }
   // Its kind comes from its name, and it has to be stored under that kind's own content type.
   const kind = uploadKindOf(doc.fileName);
   if (!kind || !rules.types.includes(kind.key) || kind.contentType !== doc.contentType) {

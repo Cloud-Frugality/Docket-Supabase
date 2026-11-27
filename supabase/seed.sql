@@ -163,12 +163,9 @@ begin
     ('Client filter chips overflow on narrow screens', 'Client Management', 'UI / Visual', 'Low', 'Chrome', 'Open',
      'With four or more filters applied the chips run off the right edge at tablet width.', null, '/clients', p_emma);
 
-  insert into public.feature_requests (title, area, feature_type, impact, description, status, requested_by) values
+  insert into public.feature_requests (title, area, feature_type, impact, description, requested_by) values
     ('Export the client list to Excel', 'Client Management', 'Reporting', 'Would save time',
-     'A one-click export of the filtered client list for monthly account reviews.', 'Open', p_thandi),
+     'A one-click export of the filtered client list for monthly account reviews.', p_thandi),
     ('Show engagement value on the card', 'Engagement Management', 'Enhancement', 'Nice to have',
-     'Seeing the contract value at a glance would help when prioritising.', 'Under Review', p_sipho);
-  insert into public.feature_request_votes (feature_request_id, user_id)
-    select fr.id, u from public.feature_requests fr, unnest(array[p_liam, p_priya, v_admin]) as u
-    where fr.title = 'Export the client list to Excel';
+     'Seeing the contract value at a glance would help when prioritising.', p_sipho);
 end $$;

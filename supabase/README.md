@@ -13,7 +13,7 @@ Each function is one domain. `GET` routes on a `?action=` query param (none = th
 | `client_administration` | Clients and their files |
 | `engagement_administration` | Engagements, their administrators and their files |
 | `document_administration` | The Documents page: every engagement and client file |
-| `bug_administration`, `feature_request_administration` | In-app defect log and feature board |
+| `bug_administration`, `feature_request_administration` | In-app defect log and feature requests |
 | `preference_administration` | View preferences that follow the user |
 
 ## Function secrets

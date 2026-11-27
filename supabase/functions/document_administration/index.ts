@@ -117,10 +117,14 @@ function applyFilters(query: any, params: URLSearchParams, ownUploader: string |
   if (recordIds.length) q = q.in("record_id", recordIds);
   const folderId = params.get("folderId") ?? "";
   if (isUuid(folderId)) q = q.eq("folder_id", folderId);
+  // Only what sits directly on its record, in no folder.
+  else if (params.get("direct") === "true") q = q.is("folder_id", null);
   const workTypes = list(params, "workTypes");
   if (workTypes.length) q = q.in("work_type", workTypes);
   const uploaderIds = list(params, "uploaderIds").filter(isUuid);
   if (uploaderIds.length) q = q.in("uploaded_by", uploaderIds);
+  const removedByIds = list(params, "removedByIds").filter(isUuid);
+  if (removedByIds.length) q = q.in("archived_by", removedByIds);
 
   // Free text over the name, the reference and whose it is. PostgREST's or()
   // syntax gives commas, brackets and quotes meaning, so they're dropped.
@@ -306,7 +310,7 @@ async function handleFacets(serviceClient: ServiceClient, request: Request, ownU
   const { data, error } = await selectAllRows(() => {
     const q = serviceClient
       .from("document_register")
-      .select("id, record, client_id, client_name, document_type, work_type, uploaded_by")
+      .select("id, record, record_id, client_id, client_name, document_type, work_type, uploaded_by")
       .eq("is_latest", true);
     return applyDocumentAccess(applyOwnScope(q, ownUploader, access), access).order("id");
   });
@@ -316,9 +320,17 @@ async function handleFacets(serviceClient: ServiceClient, request: Request, ownU
   const types = new Set<string>();
   const workTypes = new Set<string>();
   const uploaderIds = new Set<string>();
+  // How many files each client has in all, and each client's own files or engagement.
+  const clientFiles: Record<string, number> = {};
+  const recordFiles: Record<string, number> = {};
   for (const row of data) {
     if (typeof row.uploaded_by === "string") uploaderIds.add(row.uploaded_by);
-    if (typeof row.client_id === "string") clients.set(row.client_id, String(row.client_name ?? ""));
+    if (typeof row.client_id === "string") {
+      clients.set(row.client_id, String(row.client_name ?? ""));
+      clientFiles[row.client_id] = (clientFiles[row.client_id] ?? 0) + 1;
+    }
+    const recordKey = `${row.record}:${row.record_id}`;
+    recordFiles[recordKey] = (recordFiles[recordKey] ?? 0) + 1;
     if (typeof row.document_type === "string") types.add(row.document_type);
     if (typeof row.work_type === "string" && row.work_type) workTypes.add(row.work_type);
   }
@@ -328,6 +340,55 @@ async function handleFacets(serviceClient: ServiceClient, request: Request, ownU
     types: [...types].sort(),
     workTypes: [...workTypes].sort(),
     uploaders: peopleOptions(uploaderIds, names),
+    counts: { clients: clientFiles, records: recordFiles },
+  }, request);
+}
+
+/**
+ * Where the recycle bin's files were filed: only the clients, engagements and
+ * folders that have a removed file, and how many each holds. `uploader`
+ * narrows it to one person's removals, as the bin's list is.
+ */
+async function handleBinTree(serviceClient: ServiceClient, request: Request, uploader: string | null, access: DocumentAccess) {
+  const { data, error } = await selectAllRows(() => {
+    const q = serviceClient
+      .from("document_register")
+      .select("id, record, record_id, record_name, client_id, client_name, folder_id, document_type, archived_by")
+      .not("archived_at", "is", null);
+    return applyDocumentAccess(uploader ? q.eq("uploaded_by", uploader) : q, access).order("id");
+  });
+  if (error) return internalError(request, error, "recycle bin tree");
+
+  const clients = new Map<string, { id: string; name: string; canFile: boolean; engagements: Map<string, string> }>();
+  const counts = { clients: {} as Record<string, number>, records: {} as Record<string, number>, folders: {} as Record<string, number> };
+  const add = (into: Record<string, number>, key: string) => { into[key] = (into[key] ?? 0) + 1; };
+  // What the list's column filters offer: only what a removed file has.
+  const types = new Set<string>();
+  const removerIds = new Set<string>();
+  for (const row of data as Row[]) {
+    if (typeof row.document_type === "string") types.add(row.document_type);
+    if (typeof row.archived_by === "string") removerIds.add(row.archived_by);
+    const clientId = String(row.client_id);
+    const client = clients.get(clientId) ?? { id: clientId, name: String(row.client_name ?? ""), canFile: false, engagements: new Map() };
+    clients.set(clientId, client);
+    // `canFile` is the tree's word for "show the client's own files".
+    if (row.record === "client") client.canFile = true;
+    else client.engagements.set(String(row.record_id), String(row.record_name ?? ""));
+    add(counts.clients, clientId);
+    add(counts.records, `${row.record}:${row.record_id}`);
+    if (typeof row.folder_id === "string") add(counts.folders, row.folder_id);
+  }
+  const names = await buildDisplayNameMap(serviceClient, removerIds);
+  return jsonResponse({
+    types: [...types].sort(),
+    removers: peopleOptions(removerIds, names),
+    clients: [...clients.values()].map((c) => ({
+      id: c.id,
+      name: c.name,
+      canFile: c.canFile,
+      engagements: [...c.engagements].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name)),
+    })),
+    counts,
   }, request);
 }
 
@@ -335,21 +396,44 @@ async function handleFacets(serviceClient: ServiceClient, request: Request, ownU
 const folderOwner = (record: string) => (record === "client" ? "client_id" : "engagement_id");
 
 /** Every folder on one client or engagement. The page nests them by parent. */
-async function handleFolders(serviceClient: ServiceClient, request: Request, params: URLSearchParams, access: DocumentAccess) {
+async function handleFolders(serviceClient: ServiceClient, request: Request, params: URLSearchParams, ownUploader: string | null, access: DocumentAccess) {
   const record = params.get("record") ?? "";
   const recordId = params.get("recordId") ?? "";
   if (!(record in REGISTER) || !isUuid(recordId)) return jsonResponse({ error: "Invalid record." }, request, 400);
-  const { data, error } = await serviceClient
-    .from("document_folders")
-    .select("id, parent_id, name, restricted")
-    .eq(folderOwner(record), recordId)
-    .order("name");
-  if (error) return internalError(request, error, "document folders");
+  const [{ data, error }, files] = await Promise.all([
+    serviceClient
+      .from("document_folders")
+      .select("id, parent_id, name, restricted")
+      .eq(folderOwner(record), recordId)
+      .order("name"),
+    // The files the caller's list would show here, so a count never gives away one it hides.
+    selectAllRows(() => {
+      const q = serviceClient
+        .from("document_register")
+        .select("id, folder_id")
+        .not("folder_id", "is", null)
+        .eq("record", record)
+        .eq("record_id", recordId)
+        .eq("is_latest", true);
+      return applyDocumentAccess(applyOwnScope(q, ownUploader, access), access).order("id");
+    }),
+  ]);
+  if (error ?? files.error) return internalError(request, error ?? files.error, "document folders");
+  const inFolder = new Map<string, number>();
+  for (const file of files.data as Row[]) {
+    if (typeof file.folder_id === "string") inFolder.set(file.folder_id, (inFolder.get(file.folder_id) ?? 0) + 1);
+  }
   return jsonResponse({
     // A restricted folder the caller isn't named for is left out, with everything in it.
     folders: ((data ?? []) as Row[])
       .filter((f) => !access.deniedFolders.has(String(f.id)))
-      .map((f) => ({ id: f.id, parentId: f.parent_id ?? null, name: f.name, restricted: f.restricted === true })),
+      .map((f) => ({
+        id: f.id,
+        parentId: f.parent_id ?? null,
+        name: f.name,
+        restricted: f.restricted === true,
+        files: inFolder.get(String(f.id)) ?? 0,
+      })),
   }, request);
 }
 
@@ -1291,9 +1375,14 @@ Deno.serve((request) =>
         if (!scope.ok) return jsonResponse({ error: scope.error }, request, 403);
         return handleList(serviceClient, request, params, scope.uploader, access, true);
       }
+      if (action === "bin_tree") {
+        const scope = binScope(perm.level, await callerLevel(serviceClient, callerId, ENTITY, "delete"), callerId);
+        if (!scope.ok) return jsonResponse({ error: scope.error }, request, 403);
+        return handleBinTree(serviceClient, request, scope.uploader, access);
+      }
       if (action === "list") return handleList(serviceClient, request, params, ownUploader, access);
       if (action === "facets") return handleFacets(serviceClient, request, ownUploader, access);
-      if (action === "folders") return handleFolders(serviceClient, request, params, access);
+      if (action === "folders") return handleFolders(serviceClient, request, params, ownUploader, access);
       if (action === "all_folders") return handleAllFolders(serviceClient, request, access);
       if (action === "versions") return handleVersions(serviceClient, request, params, ownUploader, access);
       if (action === "dashboard") return handleDashboard(serviceClient, request, callerId, ownUploader, access);

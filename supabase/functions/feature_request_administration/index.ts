@@ -2,15 +2,12 @@ import type { ServiceClient } from "../_shared/service-client.ts";
 import { internalError, jsonResponse } from "../_shared/http.ts";
 import { withAuthorizedCaller } from "../_shared/serve.ts";
 import { RATE_LIMIT_RESPONSE, takeRateLimitToken } from "../_shared/rate-limit.ts";
-import { selectAllRows } from "../_shared/paging.ts";
-import { MAX_NAME, MAX_TEXT, isUuid, overMaxLength, pickFrom } from "../_shared/validation.ts";
+import { MAX_NAME, MAX_TEXT, overMaxLength, pickFrom } from "../_shared/validation.ts";
 import {
   BUG_LOCATIONS as AREAS,
   FEATURE_IMPACTS as IMPACTS,
-  FEATURE_STATUSES as STATUSES,
   FEATURE_TYPES,
 } from "../_shared/vocabularies.ts";
-import { buildDisplayNameMap } from "../_shared/display-names.ts";
 import { callerLevel, LEVEL_ALL, LEVEL_OWN, requirePermission, type AccessAction } from "../_shared/permissions.ts";
 import {
   type DocumentEntityConfig,
@@ -80,7 +77,7 @@ Deno.serve((request) =>
 
   // Reads
   if (request.method === "GET") {
-    // The board is the Feature Requests entity.
+    // The only reads are a request's files.
     const perm = await requirePermission(serviceClient, callerId, "Feature Requests", "read");
     if (!perm.ok) return jsonResponse({ error: perm.error }, request, perm.status);
 
@@ -93,65 +90,11 @@ Deno.serve((request) =>
         ? handleListDocuments(ctx, cfg, request, url.searchParams.get("featureRequestId") ?? "")
         : handleDocumentUrl(ctx, cfg, request, url.searchParams.get("documentId") ?? "");
     }
-    const statusFilter = pickFrom(url.searchParams.get("status"), STATUSES);
-
-    let query = serviceClient
-      .from("feature_requests")
-      .select(
-        "id, reference, title, area, feature_type, impact, description, description_original, status, vote_count, requested_by, created_at",
-      )
-      .order("vote_count", { ascending: false })
-      .order("created_at", { ascending: false });
-    if (statusFilter) query = query.eq("status", statusFilter);
-    // Own: the requests this caller raised. A request belongs to the account that
-    // made it, so requested_by is the whole answer.
-    if (perm.level === LEVEL_OWN) query = query.eq("requested_by", callerId);
-
-    // Paged: every request ever raised is in this list, and an unranged read would
-    // quietly stop at 1,000.
-    const { data: rows, error } = await selectAllRows(() => query.order("id"));
-    if (error) return internalError(request, error, "feature request list");
-
-    // Which of these the caller has voted for: one extra query, mapped in.
-    const { data: myVotes, error: votesError } = await serviceClient
-      .from("feature_request_votes")
-      .select("feature_request_id")
-      .eq("user_id", callerId);
-    if (votesError) return internalError(request, votesError, "feature request votes");
-
-    const voted = new Set((myVotes ?? []).map((v) => v.feature_request_id as string));
-
-    // Resolve requester ids to display names in one go so the feed shows names,
-    // not raw ids.
-    const requesterIds = new Set<string>();
-    for (const r of rows ?? []) {
-      if (typeof r.requested_by === "string" && r.requested_by) requesterIds.add(r.requested_by);
-    }
-    const nameById = await buildDisplayNameMap(serviceClient, requesterIds);
-
-    const items = (rows ?? []).map((r) => ({
-      id: r.id,
-      reference: r.reference,
-      title: r.title,
-      area: r.area,
-      featureType: r.feature_type,
-      impact: r.impact,
-      description: r.description,
-      descriptionOriginal: r.description_original,
-      status: r.status,
-      voteCount: r.vote_count,
-      requestedBy: r.requested_by,
-      requestedByName: r.requested_by ? (nameById.get(r.requested_by as string) ?? null) : null,
-      createdAt: r.created_at,
-      hasVoted: voted.has(r.id as string),
-    }));
-
-    return jsonResponse({ items }, request);
+    return jsonResponse({ error: `Unknown action: ${readAction}` }, request, 400);
   }
 
   // Mutations
-  // One rate-limit token per mutating request. Votes click fast, so the bucket
-  // is looser than bug reports: 15 burst, one per 2s.
+  // One rate-limit token per mutating request: 15 burst, one per 2s.
   {
     const allowed = await takeRateLimitToken(serviceClient, `feature:${callerId}`, 15, 0.5);
     if (!allowed) return jsonResponse({ error: RATE_LIMIT_RESPONSE.error }, request, RATE_LIMIT_RESPONSE.status);
@@ -166,15 +109,9 @@ Deno.serve((request) =>
 
   const action = typeof payload.action === "string" ? payload.action.trim().toLowerCase() : "";
 
-  // Creating and triaging (set_status) are writes on Feature Requests. Voting
-  // only needs read: it's part of viewing the board, and the vote rows are keyed
-  // to the caller alone.
   // One table binds each mutation to its permission.
   const MUTATIONS: Record<string, { permission: AccessAction; run: () => Promise<Response> }> = {
     create: { permission: "write", run: runCreate },
-    vote: { permission: "read", run: runVote },
-    unvote: { permission: "read", run: runVote },
-    set_status: { permission: "write", run: runSetStatus },
     // Read is only the way in: featureRequestDocumentConfig decides who may
     // change a request's files.
     document_upload_url: {
@@ -211,25 +148,7 @@ Deno.serve((request) =>
   {
     const perm = await requirePermission(serviceClient, callerId, "Feature Requests", mutation.permission);
     if (!perm.ok) return jsonResponse({ error: perm.error }, request, perm.status);
-    // Creating is always your own, so Own only matters for actions on an existing
-    // request: triaging and voting.
     ownOnly = perm.level === LEVEL_OWN;
-  }
-
-  /** 403 unless the request in hand was raised by this caller. */
-  async function denyIfNotMine(featureRequestId: string): Promise<Response | null> {
-    if (!ownOnly) return null;
-    const { data, error } = await serviceClient
-      .from("feature_requests")
-      .select("requested_by")
-      .eq("id", featureRequestId)
-      .maybeSingle();
-    // A failed read isn't "not found"; treating it as one let the handler's query
-    // run anyway under Own.
-    if (error) return internalError(request, error, "feature request owner");
-    if (!data) return null; // let the handler give its own 404
-    if (data.requested_by === callerId) return null;
-    return jsonResponse({ error: "That feature request is not yours." }, request, 403);
   }
 
   async function runCreate(): Promise<Response> {
@@ -264,7 +183,6 @@ Deno.serve((request) =>
         feature_type: featureType,
         impact,
         description,
-        status: "Open",
         requested_by: callerId,
       })
       .select("id, reference")
@@ -278,66 +196,6 @@ Deno.serve((request) =>
       id: typeof created?.id === "string" ? created.id : null,
       reference: typeof created?.reference === "string" ? created.reference : "",
     }, request);
-  }
-
-  // Vote / un-vote. The unique (feature_request_id, user_id) constraint makes a
-  // duplicate insert fail harmlessly, so voting is idempotent; the trigger keeps
-  // vote_count current.
-  async function runVote(): Promise<Response> {
-    const featureRequestId = typeof payload.featureRequestId === "string" ? payload.featureRequestId.trim() : "";
-    if (!isUuid(featureRequestId)) {
-      return jsonResponse({ error: "A valid featureRequestId is required." }, request, 400);
-    }
-    // Voting needs read, so someone who can only see their own requests can only
-    // vote on their own. You can't vote on a board you can't see.
-    const voteDenied = await denyIfNotMine(featureRequestId);
-    if (voteDenied) return voteDenied;
-
-    if (action === "vote") {
-      const { error } = await serviceClient
-        .from("feature_request_votes")
-        .upsert(
-          { feature_request_id: featureRequestId, user_id: callerId },
-          { onConflict: "feature_request_id,user_id", ignoreDuplicates: true },
-        );
-      if (error) return internalError(request, error, "feature request vote");
-    } else {
-      const { error } = await serviceClient
-        .from("feature_request_votes")
-        .delete()
-        .eq("feature_request_id", featureRequestId)
-        .eq("user_id", callerId);
-      if (error) return internalError(request, error, "feature request unvote");
-    }
-
-    // Read the fresh cached tally back so the client doesn't guess.
-    const { data: row, error: readError } = await serviceClient
-      .from("feature_requests")
-      .select("vote_count")
-      .eq("id", featureRequestId)
-      .single();
-    if (readError) return internalError(request, readError, "feature request vote count");
-
-    return jsonResponse({ voteCount: row?.vote_count ?? 0, hasVoted: action === "vote" }, request);
-  }
-
-  async function runSetStatus(): Promise<Response> {
-    const featureRequestId = typeof payload.featureRequestId === "string" ? payload.featureRequestId.trim() : "";
-    if (!isUuid(featureRequestId)) {
-      return jsonResponse({ error: "A valid featureRequestId is required." }, request, 400);
-    }
-    const statusDenied = await denyIfNotMine(featureRequestId);
-    if (statusDenied) return statusDenied;
-    const status = pickFrom(payload.status, STATUSES);
-    if (!featureRequestId || !status) {
-      return jsonResponse({ error: "featureRequestId and a valid status are required." }, request, 400);
-    }
-    const { error } = await serviceClient
-      .from("feature_requests")
-      .update({ status, updated_at: new Date().toISOString(), updated_by: callerId })
-      .eq("id", featureRequestId);
-    if (error) return internalError(request, error, "feature request status");
-    return jsonResponse({ message: "Status updated." }, request);
   }
 
   return mutation.run();

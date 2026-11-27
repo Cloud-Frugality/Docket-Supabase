@@ -123,7 +123,8 @@ export async function callerTeams(
   if (error) console.error("callerTeams failed:", error.message ?? error);
   const rows = (error ? [] : (data ?? [])) as Array<{ team_id: unknown; role: unknown }>;
   return {
-    globalAdmin: adminLevel > 0,
+    // All, not Own: Own on this entity is refused when a role is saved, but a stray one must not make an admin.
+    globalAdmin: adminLevel >= LEVEL_ALL,
     teamIds: rows.map((r) => String(r.team_id)),
     adminTeamIds: rows.filter((r) => r.role === "team_admin").map((r) => String(r.team_id)),
   };

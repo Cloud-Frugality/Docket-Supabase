@@ -64,7 +64,6 @@ export const FEATURE_TYPES = [
 ] as const;
 
 export const FEATURE_IMPACTS = ["Nice to have", "Would save time", "Blocking me", "Crucial"] as const;
-export const FEATURE_STATUSES = ["Open", "Under Review", "Planned", "In Progress", "Shipped", "Declined"] as const;
 
 // RBAC matrix, pinned against src/lib/constants.ts by the tests
 export const ACCESS_ENTITIES = [
@@ -147,7 +146,3 @@ export const SYNCED_PREFERENCE_PREFIXES = [
   "stencil-clients-",
   "stencil-engagements-",
 ] as const;
-
-// Dashboard layout keys an administrator may publish as everyone's default,
-// one per dashboard. None until the dashboard exists.
-export const DASHBOARD_LAYOUT_PREFIXES: readonly string[] = [];
