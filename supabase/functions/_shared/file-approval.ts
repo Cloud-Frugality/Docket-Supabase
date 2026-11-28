@@ -2,7 +2,7 @@
 // approvers approve it or send it back, and an approved file is kept for as
 // long as its type says. A rule can send a category to an approver group;
 // without one the file goes to the team's default approvers. Import-free, so the tests run this file;
-// the client mirrors the states in src/lib/document-types.ts (drift-tested).
+// the client mirrors the states in the Windows app.
 
 export const APPROVAL_STATES = ["none", "pending", "approved", "sent_back"] as const;
 export type ApprovalState = (typeof APPROVAL_STATES)[number];
@@ -140,15 +140,11 @@ export function parseRetentionYears(raw: unknown): { ok: true; years: number | n
 }
 
 /**
- * The approval rules of a client or engagement not saved yet: what they will
- * be scoped as, and whether the caller may set them. An engagement names its
- * team and needs the caller in it (or a global admin); a client has no team.
- * Either way the caller must be able to write that kind of record.
+ * Whether the caller may set the approval rules of a client or engagement not
+ * saved yet. Both are a team's (an engagement takes its client's), so the
+ * caller must be in that team (or a global admin) and able to write that kind
+ * of record.
  */
-export function draftRuleRight(input: { teamId: string | null; writeLevel: number; inTeam: boolean; globalAdmin: boolean }): {
-  scope: "client" | "engagement";
-  allowed: boolean;
-} {
-  const scope = input.teamId ? "engagement" : "client";
-  return { scope, allowed: input.writeLevel > 0 && (scope === "client" || input.globalAdmin || input.inTeam) };
+export function draftRuleRight(input: { writeLevel: number; inTeam: boolean; globalAdmin: boolean }): boolean {
+  return input.writeLevel > 0 && (input.globalAdmin || input.inTeam);
 }

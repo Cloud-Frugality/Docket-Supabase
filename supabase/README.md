@@ -1,6 +1,6 @@
 # Supabase: Edge Functions and migrations
 
-The browser never touches tables. Every table has RLS on with no client policies; the Edge Functions use the service key and check RBAC themselves (`_shared/permissions.ts`).
+The Windows app never touches tables. Every table has RLS on with no client policies; the Edge Functions use the service key and check RBAC themselves (`_shared/permissions.ts`).
 
 ## Edge Functions
 

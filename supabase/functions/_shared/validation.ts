@@ -76,7 +76,7 @@ export function pickFrom<T extends readonly string[]>(value: unknown, allowed: T
 
 // An email address, loosely: something@something.tld with no whitespace. GoTrue
 // does the real check when an address becomes a login. Mirrored in
-// src/lib/email.ts.
+// the Windows app.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export function isEmail(value: string): boolean {
   return EMAIL_RE.test(value);

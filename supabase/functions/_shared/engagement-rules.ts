@@ -146,12 +146,12 @@ export function entityDeleteError(isDefault: boolean, uses: { engagements: numbe
 
 export type { CallerTeams };
 
-/** Clients belong to the organisation, but only someone in a team adds or
- *  changes one. */
-export function clientWriteError(caller: CallerTeams): string | null {
-  return caller.globalAdmin || caller.teamIds.length > 0
+/** A client is made in a team, by a member of it (or a global admin). Who
+ *  may change one afterwards is the visibility rule's Can edit. */
+export function clientCreateError(caller: CallerTeams, teamId: string): string | null {
+  return caller.globalAdmin || caller.teamIds.includes(teamId)
     ? null
-    : "Only members of a team can add or change clients. Ask a global admin to add you to one.";
+    : "Only members of a team can add clients to it.";
 }
 
 /** Deleting a client outright is for global admins; anyone else archives. */
@@ -159,17 +159,20 @@ export function clientDeleteError(caller: CallerTeams): string | null {
   return caller.globalAdmin ? null : "Only a global admin can delete a client. Archive it instead.";
 }
 
-/** Creating or changing an engagement is for members of its owning team (and,
- *  on a move, of the team it moves to). */
-export function engagementWriteError(caller: CallerTeams, teamId: string): string | null {
-  return caller.globalAdmin || caller.teamIds.includes(teamId)
-    ? null
-    : "Only members of the owning team can create or change this engagement.";
-}
-
 /** Archiving (the app's delete) is for the owning team's admins. */
 export function engagementArchiveError(caller: CallerTeams, teamId: string): string | null {
   return caller.globalAdmin || caller.adminTeamIds.includes(teamId)
     ? null
     : "Only a team admin of the owning team can delete this engagement.";
+}
+
+/** The plain message for a name already used under the same parent, or null
+ *  when the error is something else. */
+export function duplicateNameError(error: unknown): string | null {
+  const e = (error ?? {}) as { code?: unknown; message?: unknown; details?: unknown };
+  if (e.code !== "23505") return null;
+  const text = `${String(e.message ?? "")} ${String(e.details ?? "")}`;
+  if (text.includes("clients_team_name")) return "A client of that name is already in this team.";
+  if (text.includes("engagements_client_name")) return "An engagement of that name is already under this client.";
+  return null;
 }

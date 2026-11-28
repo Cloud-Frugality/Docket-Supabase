@@ -13,14 +13,16 @@ import { documentStoragePath, validateDocument } from "./documents.ts";
 import { storedUploadRules, type UploadRules } from "./upload-rules.ts";
 import { inspectFile, parseChecksOff } from "./file-inspection.ts";
 import { buildDisplayNameMap } from "./display-names.ts";
-import { callerLevel, callerTeams, LEVEL_ALL, LEVEL_OWN } from "./permissions.ts";
-import { legacyMetadata, parseDocumentMetadata, removalRefusal, type DocumentRecord } from "./document-rules.ts";
+import { callerLevel, LEVEL_ALL, LEVEL_OWN } from "./permissions.ts";
+import { fileNameClash, legacyMetadata, parseDocumentMetadata, removalRefusal, SAME_FILE_NAME, type DocumentRecord } from "./document-rules.ts";
 import { retentionRefusal } from "./file-approval.ts";
 import { allowedDocumentTypes } from "./document-categories.ts";
 import { appToday } from "./app-date.ts";
 import { loadOrgLocale } from "./organisation-locale.ts";
 import type { ServiceClient } from "./service-client.ts";
-import { loadDocumentAccess, rowVisible } from "./document-access-load.ts";
+import { fileCanEdit, fileSeen, placeFor, registerFor } from "./document-access-load.ts";
+import { VIEW_ONLY } from "./document-access.ts";
+import { selectAllRows } from "./paging.ts";
 import { logDocumentEvent } from "./document-events-log.ts";
 
 export interface DocumentAccessDenial {
@@ -60,6 +62,34 @@ const DOCUMENT_COLUMNS =
 const APPROVAL_COLUMNS = ", approval_state, on_hold, retain_until, folder_id, restricted, custom";
 const columnsFor = (cfg: Pick<DocumentEntityConfig, "record">) =>
   cfg.record === "feature_request" ? DOCUMENT_COLUMNS : DOCUMENT_COLUMNS + APPROVAL_COLUMNS;
+// The register has every column the list needs but the storage path.
+const LIST_COLUMNS = (DOCUMENT_COLUMNS + APPROVAL_COLUMNS).replace(" storage_path,", "");
+
+/**
+ * Whether another file already has this name where one would go (a record, and
+ * a folder or none). Names are compared on each family's latest live version,
+ * ignoring case; `familyId` is the file being named, which doesn't clash with
+ * itself. Every file counts, seen or not, since the name is the place's.
+ */
+export async function fileNameTaken(
+  serviceClient: ServiceClient,
+  cfg: Pick<DocumentEntityConfig, "table" | "idColumn">,
+  entityId: string,
+  folderId: string | null,
+  name: string,
+  familyId: string | null,
+): Promise<boolean> {
+  const { data, error } = await selectAllRows(() => {
+    const q = serviceClient.from(cfg.table).select("id, family_id, file_name, version").eq(cfg.idColumn, entityId).is("archived_at", null);
+    return (folderId ? q.eq("folder_id", folderId) : q.is("folder_id", null)).order("id");
+  });
+  if (error) throw error;
+  return fileNameClash(
+    data.map((f) => ({ familyId: String(f.family_id), fileName: String(f.file_name), version: Number(f.version ?? 1) })),
+    name,
+    familyId,
+  );
+}
 
 /** Today in the organisation's zone, which is what a retention date is read against. */
 async function orgToday(serviceClient: ServiceClient): Promise<string> {
@@ -102,12 +132,31 @@ async function readDocument(
     .eq("id", documentId)
     .maybeSingle();
   if (error || !data) return { doc: null, error };
-  // A restricted file the caller isn't named for reads as not there, for every handler below.
+  // A file the caller doesn't see reads as not there, for every handler below.
   if (cfg.record !== "feature_request") {
-    const access = await loadDocumentAccess(ctx.serviceClient, ctx.callerId, await callerTeams(ctx.serviceClient, ctx.callerId));
-    if (!rowVisible(data as Record<string, unknown>, access)) return { doc: null, error: null };
+    try {
+      if (!(await fileSeen(ctx.serviceClient, ctx.callerId, cfg.record, documentId))) return { doc: null, error: null };
+    } catch (seenError) {
+      return { doc: null, error: seenError };
+    }
   }
   return { doc: data as DocumentRow, error: null };
+}
+
+/**
+ * Why the caller can't change this file, or null. A client's or engagement's
+ * file follows file_can_edit (a lock, Can view and Can edit); the record checks
+ * still run beside it.
+ */
+async function fileEditRefusal(ctx: DocumentHandlerContext, cfg: DocumentEntityConfig, doc: DocumentRow): Promise<DocumentAccessDenial | null> {
+  if (cfg.record === "feature_request") return null;
+  try {
+    if (await fileCanEdit(ctx.serviceClient, ctx.callerId, cfg.record, doc.family_id)) return null;
+  } catch (error) {
+    console.error("file access:", (error as { message?: string }).message ?? error);
+    return { error: "Unable to read the file's access.", status: 500 };
+  }
+  return { error: VIEW_ONLY, status: 403 };
 }
 
 /** The file as its history names it. */
@@ -137,19 +186,18 @@ export async function handleListDocuments(
   const denied = await cfg.checkAccess(entityId, "read");
   if (denied) return jsonResponse({ error: denied.error }, request, denied.status);
 
-  const { data, error } = await ctx.serviceClient
-    .from(cfg.table)
-    .select(columnsFor(cfg))
-    .eq(cfg.idColumn, entityId)
-    .order("created_at", { ascending: false });
+  // A client's or engagement's files are the ones the caller sees, through the register.
+  const { data, error } = cfg.record === "feature_request"
+    ? await ctx.serviceClient.from(cfg.table).select(columnsFor(cfg)).eq(cfg.idColumn, entityId).order("created_at", { ascending: false })
+    : await registerFor(ctx.serviceClient, ctx.callerId, LIST_COLUMNS)
+      .eq("record", cfg.record)
+      .eq("record_id", entityId)
+      .order("created_at", { ascending: false })
+      .order("id");
 
   if (error) return internalError(request, error, `list ${cfg.entityLabel} documents`);
 
-  let rows = (data ?? []) as unknown as DocumentRow[];
-  if (cfg.record !== "feature_request") {
-    const access = await loadDocumentAccess(ctx.serviceClient, ctx.callerId, await callerTeams(ctx.serviceClient, ctx.callerId));
-    rows = rows.filter((row) => rowVisible(row, access));
-  }
+  const rows = (data ?? []) as unknown as DocumentRow[];
   const uploaderIds = new Set(
     rows.map((r) => r.uploaded_by).filter((id): id is string => typeof id === "string" && !!id),
   );
@@ -342,13 +390,15 @@ export async function handleRegisterDocument(
   if (payload.folderId && !versionOf && (cfg.record === "client" || cfg.record === "engagement")) {
     const named = typeof payload.folderId === "string" ? payload.folderId : "";
     if (!isUuid(named)) return jsonResponse({ error: "Invalid folder." }, request, 400);
-    const { data: folder, error: folderError } = await serviceClient
-      .from("document_folders").select("id, client_id, engagement_id").eq("id", named).maybeSingle();
-    if (folderError) return internalError(request, folderError, "read folder");
-    const access = await loadDocumentAccess(serviceClient, callerId, await callerTeams(serviceClient, callerId));
-    const onRecord = folder && (cfg.record === "client" ? folder.client_id : folder.engagement_id) === entityId;
-    // A restricted folder the caller isn't named for reads as not there.
-    if (!onRecord || access.deniedFolders.has(named)) return jsonResponse({ error: "That folder is not on this record." }, request, 400);
+    let place;
+    try {
+      place = await placeFor(serviceClient, callerId, "folder", named);
+    } catch (folderError) {
+      return internalError(request, folderError, "read folder");
+    }
+    // A folder the caller doesn't see reads as not there.
+    if (!place || !place.seen || place.recordId !== entityId) return jsonResponse({ error: "That folder is not on this record." }, request, 400);
+    if (!place.canEdit) return jsonResponse({ error: "You can't add files to that folder." }, request, 403);
     folderId = named;
   }
 
@@ -362,6 +412,10 @@ export async function handleRegisterDocument(
     if (!source || String(source[cfg.idColumn]) !== entityId) {
       return jsonResponse({ error: "The file this replaces is not on this record." }, request, 400);
     }
+    const viewOnly = await fileEditRefusal(ctx, cfg, source);
+    if (viewOnly) return jsonResponse({ error: viewOnly.error }, request, viewOnly.status);
+    // A new version sits where its family does (the database holds to that too).
+    folderId = typeof source.folder_id === "string" ? source.folder_id : null;
     const { data: top, error: topError } = await serviceClient
       .from(cfg.table)
       .select("version")
@@ -371,6 +425,19 @@ export async function handleRegisterDocument(
       .maybeSingle();
     if (topError) return internalError(request, topError, `read ${cfg.entityLabel} document versions`);
     family = { familyId: source.family_id, version: Number(top?.version ?? source.version) + 1 };
+  }
+
+  // A new file needs a name nothing else here has; a new version keeps its family's place.
+  if (!family && cfg.record !== "feature_request") {
+    try {
+      if (await fileNameTaken(serviceClient, cfg, entityId, folderId, fileName, null)) {
+        // The upload has landed already; it isn't kept.
+        await serviceClient.storage.from(cfg.bucket).remove([path]);
+        return jsonResponse({ error: SAME_FILE_NAME }, request, 409);
+      }
+    } catch (nameError) {
+      return internalError(request, nameError, `check ${cfg.entityLabel} document name`);
+    }
   }
 
   // Confirm the object landed, and take the size from storage rather than the
@@ -547,6 +614,8 @@ export async function handleUpdateDocument(
   const readDenied = await cfg.checkAccess(String(doc[cfg.idColumn]), "read");
   if (readDenied) return jsonResponse({ error: readDenied.error }, request, readDenied.status);
   const writeDenied = await cfg.checkAccess(String(doc[cfg.idColumn]), "write");
+  const viewOnly = await fileEditRefusal(ctx, cfg, doc);
+  if (viewOnly) return jsonResponse({ error: viewOnly.error }, request, viewOnly.status);
 
   return updateDocumentMetadata(ctx, cfg, request, doc, payload.metadata, writeDenied === null, String(doc[cfg.idColumn]));
 }
@@ -578,6 +647,8 @@ export async function handleDeleteDocument(
   // scope and archived guard).
   const denied = await cfg.checkAccess(String(doc[cfg.idColumn]), deleteLevel > 0 ? "read" : "write");
   if (denied) return jsonResponse({ error: denied.error }, request, denied.status);
+  const viewOnly = await fileEditRefusal(ctx, cfg, doc);
+  if (viewOnly) return jsonResponse({ error: viewOnly.error }, request, viewOnly.status);
 
   const refusal = heldOrRetained(doc, await orgToday(serviceClient)) ?? removalRefusal({
     status: doc.status,
@@ -620,6 +691,22 @@ export async function handleRestoreDocument(
   if (!mayManageRemoved(await documentsDeleteLevel(ctx), doc.uploaded_by, ctx.callerId)) {
     return jsonResponse({ error: "Only someone who can manage documents can restore a removed file." }, request, 403);
   }
+  const viewOnly = await fileEditRefusal(ctx, cfg, doc);
+  if (viewOnly) return jsonResponse({ error: viewOnly.error }, request, viewOnly.status);
+  // Coming back as its family's latest version, it takes its name back, so nothing else here may have it.
+  if (cfg.record !== "feature_request") {
+    const { data: later, error: laterError } = await ctx.serviceClient
+      .from(cfg.table).select("id").eq("family_id", doc.family_id).is("archived_at", null).gt("version", doc.version).limit(1);
+    if (laterError) return internalError(request, laterError, `read ${cfg.entityLabel} document versions`);
+    try {
+      const folderId = typeof doc.folder_id === "string" ? doc.folder_id : null;
+      if ((later ?? []).length === 0 && await fileNameTaken(ctx.serviceClient, cfg, String(doc[cfg.idColumn]), folderId, doc.file_name, doc.family_id)) {
+        return jsonResponse({ error: SAME_FILE_NAME }, request, 409);
+      }
+    } catch (nameError) {
+      return internalError(request, nameError, `check ${cfg.entityLabel} document name`);
+    }
+  }
 
   const { error: restoreError } = await ctx.serviceClient
     .from(cfg.table)
@@ -656,6 +743,8 @@ export async function handlePurgeDocument(
   if (!mayManageRemoved(await documentsDeleteLevel(ctx), doc.uploaded_by, ctx.callerId)) {
     return jsonResponse({ error: "Only someone who can manage documents can delete a file for good." }, request, 403);
   }
+  const viewOnly = await fileEditRefusal(ctx, cfg, doc);
+  if (viewOnly) return jsonResponse({ error: viewOnly.error }, request, viewOnly.status);
 
   // A file removed before its hold or approval can still be held or retained.
   const held = heldOrRetained(doc, await orgToday(ctx.serviceClient));

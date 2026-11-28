@@ -1,7 +1,7 @@
 // The app's fixed vocabularies, enforced server-side so a direct API caller
 // can't store an unknown value (or hit an enum and get an opaque 500).
 // Import-free so the tests run this file. Keep in step with
-// src/lib/constants.ts; tests/lib/vocabularies.test.ts fails on drift.
+// the Windows app.
 
 export const INDUSTRIES = [
   "Finance",
@@ -20,7 +20,7 @@ export const INDUSTRIES = [
 // Clients archive rather than carry a status, and engagement types are rows
 // in engagement_types, so neither has a vocabulary here.
 
-// Bug logging (keep in step with src/lib/constants.ts)
+// Bug logging (keep in step with the Windows app)
 export const BUG_LOCATIONS = [
   "Sign In",
   "Navigation / Shell",
@@ -50,7 +50,7 @@ export const BROWSERS = ["Chrome", "Edge", "Firefox", "Safari", "Other"] as cons
 // copy.
 export const BUG_STATUSES = ["Open", "In Progress", "Re-test", "Closed"] as const;
 
-// Feature requests (keep in step with src/lib/constants.ts). They share the
+// Feature requests (keep in step with the Windows app). They share the
 // area vocabulary with bugs: feature_request_administration uses
 // BUG_LOCATIONS directly.
 export const FEATURE_TYPES = [
@@ -65,7 +65,7 @@ export const FEATURE_TYPES = [
 
 export const FEATURE_IMPACTS = ["Nice to have", "Would save time", "Blocking me", "Crucial"] as const;
 
-// RBAC matrix, pinned against src/lib/constants.ts by the tests
+// RBAC matrix, kept in step with the Windows app
 export const ACCESS_ENTITIES = [
   "Clients",
   "Engagements",
@@ -87,11 +87,11 @@ export const ACCESS_NO_OWN_ENTITIES = ["Bug Reports", "Users & Access Roles"] as
 
 // A person's role within one team. Not an access role: access roles say what
 // you may do, this says whether you run the team. Keep in step with TEAM_ROLES
-// in src/lib/constants.ts.
+// in the Windows app.
 export const TEAM_ROLES = ["member", "team_admin"] as const;
 
 // A team's region and default currency. The database checks the same lists;
-// keep in step with src/lib/constants.ts.
+// keep in step with the Windows app.
 export const REGIONS = ["Africa", "Americas", "Asia Pacific", "Europe", "Middle East"] as const;
 export const CURRENCIES = ["ZAR", "USD", "GBP", "EUR", "KES", "AED", "AUD"] as const;
 /** What a money value shows before the figure. */
@@ -105,7 +105,7 @@ export const CURRENCY_SYMBOLS: Record<string, string> = {
   AUD: "A$",
 };
 
-// The organisation's time zone and date format. Keep in step with src/lib/constants.ts.
+// The organisation's time zone and date format. Keep in step with the Windows app.
 export const TIME_ZONES = [
   "Africa/Johannesburg", "Africa/Nairobi", "Africa/Lagos", "Africa/Cairo",
   "Europe/London", "Europe/Dublin", "Europe/Amsterdam", "Europe/Berlin", "Europe/Paris",
@@ -118,7 +118,7 @@ export const DATE_FORMATS = ["dd MMM yyyy", "dd/MM/yyyy", "MM/dd/yyyy", "yyyy-MM
 
 // Landing pages a role can start on → the entity whose Read gates them
 // (you can't land where you can't look). Keep in step with LANDING_PAGES in
-// src/lib/constants.ts.
+// the Windows app.
 export const LANDING_ENTITY: Record<string, string> = {
   "/documents": "Documents",
   "/users": "Users",
@@ -139,9 +139,9 @@ export function vocabularyError(field: string, value: unknown, vocabulary: reado
 
 // Preferences that follow the user.
 // Key prefixes the browser may sync to user_preferences: every family in
-// PREFERENCE_PREFIXES (src/lib/storage-consent.ts) except the theme (a
+// PREFERENCE_PREFIXES (the Windows app) except the theme (a
 // per-machine choice) and the Documents page's filters. Drift-tested against
-// src/lib/preference-keys.ts.
+// the Windows app.
 export const SYNCED_PREFERENCE_PREFIXES = [
   "stencil-clients-",
   "stencil-engagements-",

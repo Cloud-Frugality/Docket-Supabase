@@ -10,24 +10,36 @@ export interface Mover {
   /** Their write level on Clients and on Engagements. */
   clientLevel: number;
   engagementLevel: number;
-  globalAdmin: boolean;
   teamIds: readonly string[];
 }
 
-/** Adding to a client needs Clients write (at Own, a client you created) and a team. */
-export function mayFileOnClient(who: Mover, createdBy: string | null): boolean {
-  if (!who.globalAdmin && who.teamIds.length === 0) return false;
-  return who.clientLevel >= LEVEL_ALL || (who.clientLevel === LEVEL_OWN && createdBy === who.callerId);
+/**
+ * Adding to a client needs Can edit on it (the visibility rule's) and Clients
+ * write: at Own, a client you created.
+ */
+export function mayFileOnClient(who: Mover, client: { createdBy: string | null; canEdit: boolean }): boolean {
+  if (!client.canEdit) return false;
+  return who.clientLevel >= LEVEL_ALL || (who.clientLevel === LEVEL_OWN && client.createdBy === who.callerId);
 }
 
-/** Adding to an engagement needs Engagements write and a place in its owning team. */
-export function mayFileOnEngagement(who: Mover, teamId: string): boolean {
-  return who.engagementLevel >= LEVEL_OWN && (who.globalAdmin || who.teamIds.includes(teamId));
+/**
+ * Adding to an engagement needs Can edit on it and Engagements write: at Own,
+ * an engagement of one of your teams.
+ */
+export function mayFileOnEngagement(who: Mover, engagement: { teamId: string; canEdit: boolean }): boolean {
+  if (!engagement.canEdit) return false;
+  return who.engagementLevel >= LEVEL_ALL || (who.engagementLevel === LEVEL_OWN && who.teamIds.includes(engagement.teamId));
+}
+
+/** A file stays in its team; only a global admin moves one to another team's work. */
+export function moveTeamRefusal(fromTeamId: string, toTeamId: string, globalAdmin: boolean): string | null {
+  return globalAdmin || fromTeamId === toTeamId ? null : "A file can only move within its team.";
 }
 
 export interface MoveTarget {
   id: string;
   name: string;
+  teamId: string;
   /** Whether a file can go on the client itself, not only on its engagements. */
   canFile: boolean;
   engagements: { id: string; name: string }[];
@@ -39,8 +51,8 @@ export interface MoveTarget {
  * by whoever reads the rows.
  */
 export function moveTargets(
-  clients: readonly { id: string; name: string; createdBy: string | null }[],
-  engagements: readonly { id: string; name: string; clientId: string; teamId: string }[],
+  clients: readonly { id: string; name: string; createdBy: string | null; teamId: string; canEdit: boolean }[],
+  engagements: readonly { id: string; name: string; clientId: string; teamId: string; canEdit: boolean }[],
   who: Mover,
 ): MoveTarget[] {
   const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
@@ -48,9 +60,10 @@ export function moveTargets(
     .map((c) => ({
       id: c.id,
       name: c.name,
-      canFile: mayFileOnClient(who, c.createdBy),
+      teamId: c.teamId,
+      canFile: mayFileOnClient(who, c),
       engagements: engagements
-        .filter((e) => e.clientId === c.id && mayFileOnEngagement(who, e.teamId))
+        .filter((e) => e.clientId === c.id && mayFileOnEngagement(who, e))
         .map((e) => ({ id: e.id, name: e.name }))
         .sort(byName),
     }))

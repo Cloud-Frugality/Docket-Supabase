@@ -3,15 +3,18 @@ import { withAuthorizedCaller } from "../_shared/serve.ts";
 import { RATE_LIMIT_RESPONSE, takeRateLimitToken } from "../_shared/rate-limit.ts";
 import type { ServiceClient } from "../_shared/service-client.ts";
 import { buildDisplayNameMap } from "../_shared/display-names.ts";
-import { isCountryCode, isDisplayName, isUniqueViolation, isUuid, MAX_NAME, overMaxLength } from "../_shared/validation.ts";
+import { isCountryCode, isDisplayName, isUuid, MAX_NAME, overMaxLength } from "../_shared/validation.ts";
 import { INDUSTRIES, inVocabulary, vocabularyError } from "../_shared/vocabularies.ts";
 import { callerTeams, LEVEL_OWN, requirePermission, type AccessAction } from "../_shared/permissions.ts";
 import {
   type CallerTeams,
+  clientCreateError,
   clientDeleteError,
   clientDetailsError,
-  clientWriteError,
+  duplicateNameError,
 } from "../_shared/engagement-rules.ts";
+import { clientsFor, engagementsFor, placeFor, teamParam } from "../_shared/document-access-load.ts";
+import { placeRefusal } from "../_shared/document-access.ts";
 import { selectAllRows, selectForIds } from "../_shared/paging.ts";
 import { listEntities, saveEntity } from "../_shared/legal-entities.ts";
 import { effectiveCountry, loadOrgLocale } from "../_shared/organisation-locale.ts";
@@ -31,10 +34,11 @@ import {
 } from "../_shared/document-handlers.ts";
 
 // Clients
-// They belong to the organisation: teams own documents, not clients. On top of
-// the access role, only someone in a team adds or changes a client and only a
-// global admin deletes one; everyone else archives. An archived client leaves
-// the lists but its documents stay.
+// Each client is a team's, and is seen by the rule in SQL (clients_for and
+// places_for): its team, global admins, and anyone added to or shared it. On
+// top of the access role, a client is made by a member of its team, changed
+// by whoever has Can edit on it, and deleted only by a global admin; everyone
+// else archives. An archived client leaves the lists but its documents stay.
 
 /** The client's optional details, trimmed. */
 function detailsFrom(payload: Record<string, unknown>) {
@@ -47,16 +51,18 @@ function detailsFrom(payload: Record<string, unknown>) {
 }
 
 /**
- * Clients with their engagement counts, archived ones included and flagged
- * (the panel hides them unless asked). `createdBy` narrows it at Own level.
- * Paged, because an unranged read stops at 1,000.
+ * The clients the caller sees, with their engagement counts, archived ones
+ * included and flagged (the panel hides them unless asked). `createdBy`
+ * narrows it at Own level, `teamId` to one team. Paged, because an unranged
+ * read stops at 1,000.
  */
-async function buildSnapshot(serviceClient: ServiceClient, createdBy: string | null = null) {
+async function buildSnapshot(serviceClient: ServiceClient, callerId: string, createdBy: string | null, teamId: string | null) {
   const CLIENT_COLUMNS =
-    "id, name, short_name, industry, country_code, primary_contact_name, primary_contact_email, archived_at, created_at, created_by";
+    "id, name, short_name, industry, country_code, primary_contact_name, primary_contact_email, archived_at, created_at, created_by, team_id, restricted, teams(name)";
   const { data: clients, error: clientError } = await selectAllRows(() => {
-    let query = serviceClient.from("clients").select(CLIENT_COLUMNS);
+    let query = clientsFor(serviceClient, callerId, CLIENT_COLUMNS);
     if (createdBy) query = query.eq("created_by", createdBy);
+    if (teamId) query = query.eq("team_id", teamId);
     return query.order("name", { ascending: true }).order("id");
   });
 
@@ -74,8 +80,9 @@ async function buildSnapshot(serviceClient: ServiceClient, createdBy: string | n
   const clientIds = clients.map((c) => String(c.id));
   const [displayNameById, engagementCountResult] = await Promise.all([
     buildDisplayNameMap(serviceClient, userIds),
+    // Only the engagements the caller sees are counted.
     selectForIds(clientIds, (chunk) =>
-      serviceClient.from("engagements").select("id, client_id, status").is("archived_at", null).in("client_id", chunk).order("id")
+      engagementsFor(serviceClient, callerId, "id, client_id, status").is("archived_at", null).in("client_id", chunk).order("id")
     ),
   ]);
 
@@ -105,6 +112,9 @@ async function buildSnapshot(serviceClient: ServiceClient, createdBy: string | n
       countryCode: str(client.country_code),
       primaryContactName: str(client.primary_contact_name),
       primaryContactEmail: str(client.primary_contact_email),
+      teamId: str(client.team_id),
+      teamName: str((client.teams as { name?: unknown } | null)?.name),
+      restricted: client.restricted === true,
       isArchived: client.archived_at !== null && client.archived_at !== undefined,
       createdAtUtc: str(client.created_at),
       createdByDisplayName: typeof client.created_by === "string"
@@ -123,8 +133,26 @@ type ClientContext = {
   ownOnly?: boolean;
 };
 
-async function handleGetSnapshot(ctx: ClientContext, request: Request): Promise<Response> {
-  const snapshot = await buildSnapshot(ctx.serviceClient, ctx.ownOnly ? ctx.callerId : null);
+/** Why the caller can't use this client, or null. Own on Clients is the clients you created. */
+async function clientRefusal(ctx: ClientContext, clientId: string, intent: "read" | "write"): Promise<{ status: number; error: string } | null> {
+  let place;
+  try {
+    place = await placeFor(ctx.serviceClient, ctx.callerId, "client", clientId);
+  } catch (error) {
+    console.error("client access:", (error as { message?: string }).message ?? error);
+    return { status: 500, error: "Unable to read the client." };
+  }
+  const refused = placeRefusal(place, intent, "client");
+  if (refused) return refused;
+  if (ctx.ownOnly) {
+    const { data } = await ctx.serviceClient.from("clients").select("created_by").eq("id", clientId).maybeSingle();
+    if (data?.created_by !== ctx.callerId) return { status: 403, error: "That client is not yours." };
+  }
+  return null;
+}
+
+async function handleGetSnapshot(ctx: ClientContext, request: Request, teamId: string | null): Promise<Response> {
+  const snapshot = await buildSnapshot(ctx.serviceClient, ctx.callerId, ctx.ownOnly ? ctx.callerId : null, teamId);
   if (!snapshot.ok) {
     return jsonResponse({ error: snapshot.error }, request, 500);
   }
@@ -162,7 +190,9 @@ async function handleCreateClient(
   request: Request,
   payload: Record<string, unknown>,
 ): Promise<Response> {
-  const teamError = clientWriteError(ctx.teams);
+  const teamId = typeof payload.teamId === "string" ? payload.teamId.trim() : "";
+  if (!isUuid(teamId)) return jsonResponse({ error: "Pick the team the client belongs to." }, request, 400);
+  const teamError = clientCreateError(ctx.teams, teamId);
   if (teamError) return jsonResponse({ error: teamError }, request, 403);
   const { clientName, industry, countryCode: askedCountry, details } = fieldsFrom(payload);
   // Locked to one country, the organisation's is the only one saved.
@@ -170,9 +200,13 @@ async function handleCreateClient(
   const inputError = clientInputError(clientName, industry, countryCode, details);
   if (inputError) return jsonResponse({ error: inputError }, request, 400);
 
-  const { data: org, error: orgError } = await ctx.serviceClient
-    .from("organisations").select("id").order("created_at").limit(1).single();
-  if (orgError) return internalError(request, orgError, "organisation");
+  const [{ data: org, error: orgError }, { data: team, error: teamReadError }] = await Promise.all([
+    ctx.serviceClient.from("organisations").select("id").order("created_at").limit(1).single(),
+    ctx.serviceClient.from("teams").select("is_active").eq("id", teamId).maybeSingle(),
+  ]);
+  if (orgError ?? teamReadError) return internalError(request, orgError ?? teamReadError, "organisation");
+  if (!team) return jsonResponse({ error: "That team does not exist." }, request, 400);
+  if (team.is_active === false) return jsonResponse({ error: "That team is inactive. Pick an active team." }, request, 400);
 
   const { data: clientInsert, error: clientInsertError } = await ctx.serviceClient
     .from("clients")
@@ -185,13 +219,13 @@ async function handleCreateClient(
       primary_contact_name: details.primaryContactName,
       primary_contact_email: details.primaryContactEmail,
       created_by: ctx.callerId,
+      team_id: teamId,
     })
     .select("id")
     .single();
 
-  if (isUniqueViolation(clientInsertError)) {
-    return jsonResponse({ error: `A client named "${clientName}" already exists.` }, request, 409);
-  }
+  const duplicate = duplicateNameError(clientInsertError);
+  if (duplicate) return jsonResponse({ error: duplicate }, request, 409);
   if (clientInsertError || !clientInsert?.id) {
     return internalError(request, clientInsertError);
   }
@@ -225,10 +259,10 @@ async function handleSetClientArchived(
   request: Request,
   payload: Record<string, unknown>,
 ): Promise<Response> {
-  const teamError = clientWriteError(ctx.teams);
-  if (teamError) return jsonResponse({ error: teamError }, request, 403);
   const clientId = typeof payload.clientId === "string" ? payload.clientId.trim() : "";
   if (!isUuid(clientId)) return jsonResponse({ error: "Invalid clientId." }, request, 400);
+  const refused = await clientRefusal(ctx, clientId, "write");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
   const archived = payload.archived === true;
 
   const { data, error } = await ctx.serviceClient
@@ -248,10 +282,10 @@ async function handleUpdateClient(
   request: Request,
   payload: Record<string, unknown>,
 ): Promise<Response> {
-  const teamError = clientWriteError(ctx.teams);
-  if (teamError) return jsonResponse({ error: teamError }, request, 403);
   const clientId = typeof payload.clientId === "string" ? payload.clientId.trim() : "";
   if (!isUuid(clientId)) return jsonResponse({ error: "Invalid clientId." }, request, 400);
+  const refused = await clientRefusal(ctx, clientId, "write");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
   const { clientName, industry, countryCode: askedCountry, details } = fieldsFrom(payload);
   // Locked to one country, the organisation's is the only one saved.
   const countryCode = effectiveCountry(askedCountry, await loadOrgLocale(ctx.serviceClient));
@@ -275,10 +309,9 @@ async function handleUpdateClient(
     updated_by: ctx.callerId,
   }).eq("id", clientId);
 
-  // Renaming onto another client's name hits the same unique constraint.
-  if (isUniqueViolation(error)) {
-    return jsonResponse({ error: `A client named "${clientName}" already exists.` }, request, 409);
-  }
+  // Renaming onto another client's name in the team hits the same unique index.
+  const duplicate = duplicateNameError(error);
+  if (duplicate) return jsonResponse({ error: duplicate }, request, 409);
   if (error) {
     return internalError(request, error);
   }
@@ -341,10 +374,10 @@ async function handleSaveEntity(
   request: Request,
   payload: Record<string, unknown>,
 ): Promise<Response> {
-  const teamError = clientWriteError(ctx.teams);
-  if (teamError) return jsonResponse({ error: teamError }, request, 403);
   const clientId = typeof payload.clientId === "string" ? payload.clientId.trim() : "";
   if (!isUuid(clientId)) return jsonResponse({ error: "Invalid clientId." }, request, 400);
+  const refused = await clientRefusal(ctx, clientId, "write");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
   const { data: client, error } = await ctx.serviceClient.from("clients").select("archived_at").eq("id", clientId).maybeSingle();
   if (error) return internalError(request, error);
   if (!client) return jsonResponse({ error: "Client not found." }, request, 404);
@@ -354,8 +387,9 @@ async function handleSaveEntity(
 }
 
 // Client documents, through the shared handlers. Read needs Clients read and
-// write needs Clients write. At Own the client must be one the caller created,
-// checked here because a delete names only the document.
+// a client the caller sees; write needs Clients write and Can edit on it. At
+// Own the client must be one the caller created, checked here because a
+// delete names only the document.
 function clientDocumentConfig(ctx: ClientContext): DocumentEntityConfig {
   return {
     table: "client_documents",
@@ -364,16 +398,14 @@ function clientDocumentConfig(ctx: ClientContext): DocumentEntityConfig {
     entityLabel: "client",
     record: "client",
     checkAccess: async (clientId, intent) => {
-      const { data, error } = await ctx.serviceClient
-        .from("clients").select("id, created_by, archived_at").eq("id", clientId).maybeSingle();
+      const refused = await clientRefusal(ctx, clientId, intent);
+      if (refused) return refused;
+      const { data, error } = await ctx.serviceClient.from("clients").select("archived_at").eq("id", clientId).maybeSingle();
       if (error) {
         console.error("client document access:", error.message);
         return { error: "Unable to read the client.", status: 500 };
       }
       if (!data) return { error: "Client not found.", status: 404 };
-      if (ctx.ownOnly && data.created_by !== ctx.callerId) {
-        return { error: "That client is not yours.", status: 403 };
-      }
       // An archived client's files are kept and readable, not added to.
       if (intent === "write" && data.archived_at) {
         return { error: "Restore the client before changing its files.", status: 400 };
@@ -459,14 +491,14 @@ Deno.serve((request) =>
     if (action === "entities") {
       const clientId = url.searchParams.get("clientId") ?? "";
       if (!isUuid(clientId)) return jsonResponse({ error: "Invalid clientId." }, request, 400);
-      if (ctx.ownOnly) {
-        const { data } = await ctx.serviceClient.from("clients").select("created_by").eq("id", clientId).maybeSingle();
-        if (data && data.created_by !== ctx.callerId) return jsonResponse({ error: "That client is not yours." }, request, 403);
-      }
+      const refused = await clientRefusal(ctx, clientId, "read");
+      if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
       const result = await listEntities(ctx.serviceClient, clientId);
       return jsonResponse(result.body, request, result.status);
     }
-    return handleGetSnapshot(ctx, request);
+    const teamId = teamParam(url.searchParams);
+    if (teamId === false) return jsonResponse({ error: "Invalid teamId." }, request, 400);
+    return handleGetSnapshot(ctx, request, teamId);
   }
 
   // Mutations
@@ -488,15 +520,6 @@ Deno.serve((request) =>
   if (!perm.ok) return jsonResponse({ error: perm.error }, request, perm.status);
   ctx.ownOnly = perm.level === LEVEL_OWN;
 
-  // Every mutation but create names an existing client; at Own it must be one
-  // the caller created. Documents resolve theirs in checkAccess.
-  const targetClientId = typeof payload.clientId === "string" ? payload.clientId : "";
-  if (ctx.ownOnly && targetClientId && action !== "create" && isUuid(targetClientId)) {
-    const { data } = await ctx.serviceClient.from("clients").select("created_by").eq("id", targetClientId).maybeSingle();
-    if (data && data.created_by !== ctx.callerId) {
-      return jsonResponse({ error: "That client is not yours." }, request, 403);
-    }
-  }
-
+  // Each handler checks the client it names (clientRefusal); documents do it in checkAccess.
   return mutation.run(ctx, request, payload);
   }));

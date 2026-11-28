@@ -4,7 +4,8 @@ import { RATE_LIMIT_RESPONSE, takeRateLimitToken } from "../_shared/rate-limit.t
 import type { ServiceClient } from "../_shared/service-client.ts";
 import { buildDisplayNameMap } from "../_shared/display-names.ts";
 import { isCountryCode, isUniqueViolation, isUuid, MAX_NAME, overMaxLength } from "../_shared/validation.ts";
-import { LEVEL_ALL, callerLevel, callerTeams } from "../_shared/permissions.ts";
+import { LEVEL_ALL, LEVEL_OWN, callerLevel, callerTeams } from "../_shared/permissions.ts";
+import { applyOwnScope, engagementsFor, loadReach, placeFor, registerFor, teamParam } from "../_shared/document-access-load.ts";
 import { selectAllRows, selectForIds } from "../_shared/paging.ts";
 import { CURRENCIES, DATE_FORMATS, TIME_ZONES } from "../_shared/vocabularies.ts";
 import { deleteEntity, isLiveEntityOf, listEntities, saveEntity } from "../_shared/legal-entities.ts";
@@ -38,8 +39,9 @@ import {
 // row. The organisation's reference lists (engagement types) live here too.
 const ADMIN_ENTITY = "Users & Access Roles";
 
+// All, not Own, as callerTeams has it: a stray Own must not make an admin.
 async function isGlobalAdmin(serviceClient: ServiceClient, callerId: string): Promise<boolean> {
-  return (await callerLevel(serviceClient, callerId, ADMIN_ENTITY, "write")) > 0;
+  return (await callerLevel(serviceClient, callerId, ADMIN_ENTITY, "write")) >= LEVEL_ALL;
 }
 
 /** The caller's role in one team, or null when they're not in it. */
@@ -76,6 +78,9 @@ Deno.serve((request) =>
       if (!data) return missing();
       return { scope, id, teamId: id, clientId: null, canRead: globalAdmin || !!role, canEdit: canManageMembers(globalAdmin, role) };
     }
+    // A client or an engagement: seen and changed as the visibility rule has it, under the access role.
+    const place = await placeFor(serviceClient, callerId, String(scope), id);
+    if (!place?.seen) return missing();
     if (scope === "client") {
       const [{ data }, read, write] = await Promise.all([
         serviceClient.from("clients").select("id, created_by").eq("id", id).maybeSingle(),
@@ -85,7 +90,14 @@ Deno.serve((request) =>
       if (!data) return missing();
       // Own on Clients is the clients you created.
       const own = data.created_by === callerId;
-      return { scope: "client", id, teamId: null, clientId: id, canRead: read >= LEVEL_ALL || (read > 0 && own), canEdit: write >= LEVEL_ALL || (write > 0 && own) };
+      return {
+        scope: "client",
+        id,
+        teamId: place.teamId,
+        clientId: id,
+        canRead: read >= LEVEL_ALL || (read > 0 && own),
+        canEdit: place.canEdit && (write >= LEVEL_ALL || (write > 0 && own)),
+      };
     }
     const [{ data }, read, write, teams] = await Promise.all([
       serviceClient.from("engagements").select("id, team_id, client_id").eq("id", id).maybeSingle(),
@@ -94,26 +106,33 @@ Deno.serve((request) =>
       callerTeams(serviceClient, callerId),
     ]);
     if (!data) return missing();
-    // An engagement is changed by its owning team's members.
-    const inTeam = globalAdmin || teams.teamIds.includes(String(data.team_id));
+    // Own on Engagements is an engagement of your teams.
+    const ofMyTeam = globalAdmin || teams.teamIds.includes(String(data.team_id));
     return {
       scope: "engagement",
       id,
       teamId: String(data.team_id),
       clientId: String(data.client_id),
-      canRead: read >= LEVEL_ALL || (read > 0 && inTeam),
-      canEdit: write > 0 && inTeam,
+      canRead: read >= LEVEL_ALL || (read > 0 && ofMyTeam),
+      canEdit: place.canEdit && (write >= LEVEL_ALL || (write > 0 && ofMyTeam)),
     };
   };
   // A client or engagement not saved yet: no rules of its own, but the groups,
-  // categories and fallbacks it will have once it is.
-  const draftRuleTarget = async (teamId: string | null, clientId: string | null) => {
-    if ((teamId && !isUuid(teamId)) || (clientId && !isUuid(clientId))) return jsonResponse({ error: "Invalid record." }, request, 400);
-    // An engagement names its team; a client has none.
-    const write = await callerLevel(serviceClient, callerId, teamId ? "Engagements" : "Clients", "write");
+  // categories and fallbacks it will have once it is. A new engagement names
+  // its client and takes the client's team; a new client names its team.
+  const draftRuleTarget = async (teamIdRaw: string | null, clientId: string | null) => {
+    if ((teamIdRaw && !isUuid(teamIdRaw)) || (clientId && !isUuid(clientId))) return jsonResponse({ error: "Invalid record." }, request, 400);
+    let teamId = teamIdRaw || null;
+    if (clientId) {
+      const place = await placeFor(serviceClient, callerId, "client", clientId);
+      if (!place?.seen) return jsonResponse({ error: "Record not found." }, request, 404);
+      teamId = place.teamId;
+    }
+    const scope: RuleScope = clientId ? "engagement" : "client";
+    const write = await callerLevel(serviceClient, callerId, scope === "engagement" ? "Engagements" : "Clients", "write");
     const inTeam = !!teamId && !globalAdmin && !!(await roleInTeam(serviceClient, teamId, callerId));
-    const { scope, allowed } = draftRuleRight({ teamId, writeLevel: write, inTeam, globalAdmin });
-    return { scope: scope as RuleScope, id: null, teamId, clientId, canRead: allowed, canEdit: allowed };
+    const allowed = draftRuleRight({ writeLevel: write, inTeam, globalAdmin });
+    return { scope, id: null, teamId, clientId, canRead: allowed, canEdit: allowed };
   };
   const RULE_COLUMN: Record<RuleScope, string> = { team: "team_id", client: "client_id", engagement: "engagement_id" };
 
@@ -213,14 +232,15 @@ Deno.serve((request) =>
     }
 
     // Engagement types: every signed-in user reads them (the engagement and
-    // forms offer them), with how many engagements use each.
+    // forms offer them), with how many of the engagements they see use each.
     if (resource === "engagement_types") {
       const { data: types, error: typeErr } = await selectAllRows(() =>
         serviceClient.from("engagement_types").select("id, name, sort_order, is_active").order("sort_order").order("id")
       );
       if (typeErr) return internalError(request, typeErr, "engagement types");
+      // Counted over the engagements the caller sees.
       const { data: uses, error: useErr } = await selectAllRows(() =>
-        serviceClient.from("engagements").select("engagement_type_id").is("archived_at", null).order("id")
+        engagementsFor(serviceClient, callerId, "id, engagement_type_id").is("archived_at", null).order("id")
       );
       if (useErr) return internalError(request, useErr, "engagement type use");
       const counts = new Map<string, number>();
@@ -243,15 +263,26 @@ Deno.serve((request) =>
     }
 
     // Document categories: every signed-in user reads them (the file forms
-    // offer them), with how many files are of each.
+    // offer them), with how many files of each the caller can see: none
+    // without Documents read, and at Own only what Own shows them. `teamId`
+    // narrows the counts to one team.
     if (resource === "categories") {
+      const teamId = teamParam(url.searchParams);
+      if (teamId === false) return jsonResponse({ error: "Invalid teamId." }, request, 400);
       const { data: categories, error } = await selectAllRows(() =>
         serviceClient.from("document_categories").select("id, name, code, sort_order, is_active, is_binding, retention_years, fields").order("sort_order").order("id")
       );
       if (error) return internalError(request, error, "categories");
       const counts = new Map<string, number>();
-      for (const table of ["engagement_documents", "client_documents"]) {
-        const { data: uses, error: useErr } = await selectAllRows(() => serviceClient.from(table).select("document_type").order("id"));
+      const documentsRead = await callerLevel(serviceClient, callerId, "Documents", "read");
+      if (documentsRead > 0) {
+        const reach = documentsRead === LEVEL_OWN ? await loadReach(serviceClient, callerId, await callerTeams(serviceClient, callerId)) : null;
+        const { data: uses, error: useErr } = await selectAllRows(() => {
+          let q = registerFor(serviceClient, callerId, "id, record, document_type");
+          if (reach) q = applyOwnScope(q, callerId, reach);
+          if (teamId) q = q.eq("team_id", teamId);
+          return q.order("record").order("id");
+        });
         if (useErr) return internalError(request, useErr, "category use");
         for (const u of uses) counts.set(String(u.document_type), (counts.get(String(u.document_type)) ?? 0) + 1);
       }
@@ -364,7 +395,8 @@ Deno.serve((request) =>
       const [own, fromClient, fromTeam, groups, categories] = await Promise.all([
         target.id ? rulesOf(target.scope, target.id) : none,
         target.scope === "engagement" && target.clientId ? rulesOf("client", target.clientId) : none,
-        target.scope === "engagement" && target.teamId ? rulesOf("team", target.teamId) : none,
+        // A client's files fall back to its team's rules too.
+        target.scope !== "team" && target.teamId ? rulesOf("team", target.teamId) : none,
         selectAllRows(() => {
           const q = serviceClient.from("approver_groups").select("id, team_id, name, requires_all");
           return (target.teamId ? q.or(`team_id.is.null,team_id.eq.${target.teamId}`) : q.is("team_id", null)).order("name").order("id");
@@ -393,7 +425,7 @@ Deno.serve((request) =>
         .from("access_role_permissions")
         .select("role_id, access_roles!inner(enabled)")
         .eq("entity", ADMIN_ENTITY)
-        .gt("write_level", 0)
+        .gte("write_level", LEVEL_ALL)
         .eq("access_roles.enabled", true);
       if (grantErr) return internalError(request, grantErr, "admin roles");
       const roleIds = Array.from(new Set<string>((grants ?? []).map((g) => String(g.role_id))));
@@ -597,11 +629,11 @@ Deno.serve((request) =>
     if (!globalAdmin) return jsonResponse({ error: GLOBAL_ONLY }, request, 403);
     const teamId = typeof payload.teamId === "string" ? payload.teamId : "";
     if (!isUuid(teamId)) return jsonResponse({ error: "A valid team id is required." }, request, 400);
-    // Memberships cascade away with the team; engagements it owns block the
-    // delete (on delete restrict), so they have to move first.
+    // Memberships cascade away with the team; the clients and engagements it
+    // owns block the delete (on delete restrict).
     const { error } = await serviceClient.from("teams").delete().eq("id", teamId);
     if ((error as { code?: string } | null)?.code === "23503") {
-      return jsonResponse({ error: "This team owns engagements. Move them to another team first." }, request, 409);
+      return jsonResponse({ error: "This team owns clients or engagements, so it can't be deleted. Switch it off instead." }, request, 409);
     }
     if (error) return internalError(request, error, "team delete");
     return jsonResponse({ message: "Team deleted." }, request);

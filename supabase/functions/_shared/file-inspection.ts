@@ -9,7 +9,7 @@
 // well enough to check is refused too.
 //
 // Each check is the organisation's to switch off (UPLOAD_CHECKS, mirrored in
-// src/lib/upload-checks.ts and drift-tested). A file is read for everything
+// the Windows app). A file is read for everything
 // it has wrong with it, and refused for the first of those still switched on.
 
 import { uploadKindOf } from "./upload-rules.ts";

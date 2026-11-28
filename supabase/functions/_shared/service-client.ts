@@ -5,7 +5,7 @@ export interface ServiceClient {
   // deno-lint-ignore no-explicit-any
   from(table: string): any;
   // deno-lint-ignore no-explicit-any
-  rpc(fn: string, args?: Record<string, unknown>): any;
+  rpc(fn: string, args?: Record<string, unknown>, options?: Record<string, unknown>): any;
   // deno-lint-ignore no-explicit-any
   storage: any;
   // deno-lint-ignore no-explicit-any

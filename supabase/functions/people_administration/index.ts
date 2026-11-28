@@ -120,10 +120,15 @@ Deno.serve((request) =>
       // Last sign-in lives on the login, not the profile. listUsers pages at
       // most 1,000 at a time.
       const lastSignInById = new Map<string, string>();
+      // Never signed in and never confirmed: the invitation can be sent again.
+      const invitePending = new Set<string>();
       for (let page = 1; ; page++) {
         const { data: users, error: usersError } = await serviceClient.auth.admin.listUsers({ page, perPage: 1000 });
         if (usersError) return internalError(request, usersError, "last sign-in");
-        for (const u of users.users) if (u.last_sign_in_at) lastSignInById.set(u.id, u.last_sign_in_at);
+        for (const u of users.users) {
+          if (u.last_sign_in_at) lastSignInById.set(u.id, u.last_sign_in_at);
+          else if (!u.email_confirmed_at) invitePending.add(u.id);
+        }
         if (users.users.length < 1000) break;
       }
 
@@ -147,6 +152,7 @@ Deno.serve((request) =>
             ? (displayNameById.get(p.created_by) ?? "Unknown")
             : "Unknown",
           lastSignInAtUtc: lastSignInById.get(String(p.id)) ?? null,
+          invitePending: invitePending.has(String(p.id)),
           // What documents and approvals need.
           phone: typeof p.phone === "string" ? p.phone : "",
           countryCode: typeof p.country_code === "string" ? p.country_code : "",
@@ -175,6 +181,7 @@ Deno.serve((request) =>
       update: { permission: "write", account: false, run: () => handleUpdate() },
       set_disabled: { permission: "write", account: true, run: () => handleSetDisabled() },
       reset_mfa: { permission: "write", account: true, run: () => handleResetMfa() },
+      resend_invite: { permission: "write", account: true, run: () => handleResendInvite() },
       delete: { permission: "delete", account: true, run: () => handleDelete() },
     };
     const mutation = Object.hasOwn(mutations, action) ? mutations[action] : undefined;
@@ -367,6 +374,30 @@ Deno.serve((request) =>
         .eq("id", personId);
       if (error) return internalError(request, error);
       return jsonResponse({ message: isDisabled ? "Person disabled." : "Person enabled." }, request);
+    }
+
+    // Someone who never took up their invitation gets it again. GoTrue sends a
+    // fresh invite to a login that hasn't confirmed its email yet; one that has
+    // is past this point and refused.
+    async function handleResendInvite(): Promise<Response> {
+      const { data: userData, error: getErr } = await serviceClient.auth.admin.getUserById(personId);
+      if (getErr) return internalError(request, getErr);
+      const user = userData?.user as { email?: string; email_confirmed_at?: string | null; last_sign_in_at?: string | null } | undefined;
+      if (!user?.email) return jsonResponse({ error: "Person not found." }, request, 404);
+      if (user.last_sign_in_at || user.email_confirmed_at) {
+        return jsonResponse({ error: "This person has already accepted their invitation." }, request, 400);
+      }
+      const { data: profile } = await serviceClient.from("profiles").select("status").eq("id", personId).maybeSingle();
+      if (profile?.status !== "active") return jsonResponse({ error: "Enable this person before inviting them again." }, request, 400);
+      const { error: inviteError } = await serviceClient.auth.admin.inviteUserByEmail(user.email);
+      if (inviteError) {
+        // GoTrue spaces out emails to one address.
+        if ((inviteError as { status?: number }).status === 429 || /seconds|rate/i.test(String(inviteError.message))) {
+          return jsonResponse({ error: "An invitation was sent a moment ago. Wait a minute and try again." }, request, 429);
+        }
+        return internalError(request, inviteError);
+      }
+      return jsonResponse({ message: "Invitation sent again." }, request);
     }
 
     // A lost authenticator: remove every factor, so the MFA gate walks the person

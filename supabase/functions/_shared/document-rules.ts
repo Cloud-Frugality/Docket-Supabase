@@ -1,6 +1,6 @@
 // What a document is, and who may remove it. Import-free so the tests run this
-// file; the client mirrors the vocabularies in src/lib/document-types.ts
-// (drift-tested). The types themselves are rows (document_categories). A Signed file is never removed, only superseded by a new
+// file; the client mirrors the vocabularies in the Windows app
+//. The types themselves are rows (document_categories). A Signed file is never removed, only superseded by a new
 // version.
 
 import { parseCustomValues, type CategoryField } from "./document-fields.ts";
@@ -181,4 +181,27 @@ export function removalRefusal(input: {
     return `Only a Draft, or a file uploaded in the last ${OWN_REMOVE_WINDOW_HOURS} hours, can be removed by the person who uploaded it. Ask someone who can manage documents.`;
   }
   return "Only the person who uploaded this file, or someone who can manage documents, can remove it.";
+}
+
+// Neutral on purpose: the clash may be with a file the caller can't see.
+export const SAME_FILE_NAME = "That name is already taken here. Choose another.";
+
+/**
+ * Whether a name is already taken in one place: one live file per name,
+ * ignoring case. `files` are the place's live versions; each family goes by
+ * its latest. `familyId` is the file being named, which can't clash with
+ * itself (null for a new file).
+ */
+export function fileNameClash(
+  files: readonly { familyId: string; fileName: string; version: number }[],
+  name: string,
+  familyId: string | null,
+): boolean {
+  const latest = new Map<string, { fileName: string; version: number }>();
+  for (const file of files) {
+    const known = latest.get(file.familyId);
+    if (!known || file.version > known.version) latest.set(file.familyId, file);
+  }
+  const wanted = name.trim().toLowerCase();
+  return [...latest].some(([family, file]) => family !== familyId && file.fileName.trim().toLowerCase() === wanted);
 }

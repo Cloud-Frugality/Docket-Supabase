@@ -5,11 +5,13 @@ import { isUuid } from "../_shared/validation.ts";
 import { buildDisplayNameMap } from "../_shared/display-names.ts";
 import {
   type CallerTeams,
+  duplicateNameError,
   engagementArchiveError,
   engagementInputError,
-  engagementWriteError,
   normalizeEngagementStatus,
 } from "../_shared/engagement-rules.ts";
+import { engagementsFor, placeFor, teamParam } from "../_shared/document-access-load.ts";
+import { placeRefusal } from "../_shared/document-access.ts";
 import { selectAllRows } from "../_shared/paging.ts";
 import { type DocumentEntityConfig, handleDeleteDocument as sharedDeleteDocument, handleDocumentUploadUrl as sharedDocumentUploadUrl, handleDocumentUrl as sharedDocumentUrl, handleListDocuments as sharedListDocuments, handlePurgeDocument as sharedPurgeDocument, handleRegisterDocument as sharedRegisterDocument, handleRestoreDocument as sharedRestoreDocument, handleUpdateDocument as sharedUpdateDocument } from "../_shared/document-handlers.ts";
 import { callerTeams, LEVEL_OWN, requirePermission, type AccessAction } from "../_shared/permissions.ts";
@@ -20,10 +22,12 @@ import { applyFolderTemplate } from "../_shared/folder-template-apply.ts";
 import { effectiveCountry, loadOrgLocale } from "../_shared/organisation-locale.ts";
 
 // Engagements
-// An engagement belongs to a client and has an owning team and a type from
-// engagement_types. On top of the access role, only the owning team's members
-// create or change one, and only its team admins archive it. Own on
-// Engagements means engagements a team of yours owns.
+// An engagement belongs to a client, is its client's team's (a trigger keeps
+// team_id in step) and has a type from engagement_types. Who sees one is the
+// rule in SQL (engagements_for and places_for). On top of the access role, it
+// is created under a client the caller has Can edit on, changed with Can edit
+// on it, and archived only by its team admins. Own on Engagements means
+// engagements a team of yours owns.
 
 type EngagementContext = {
   serviceClient: ServiceClient;
@@ -67,28 +71,40 @@ async function getEngagement(
   };
 }
 
-/** The client, type and team an engagement points at all exist and are
- *  usable; else the refusal message. */
+/** The client and type an engagement points at exist and are usable; else
+ *  the refusal message. A new engagement also needs its client's team active.
+ *  Returns the client's team, which the engagement takes. */
 async function referencesError(
   serviceClient: ServiceClient,
-  input: { clientId: string; engagementTypeId: string; teamId: string },
-): Promise<{ error: string; statusCode: number } | null> {
-  const [client, type, team] = await Promise.all([
-    serviceClient.from("clients").select("archived_at").eq("id", input.clientId).maybeSingle(),
+  input: { clientId: string; engagementTypeId: string },
+  creating: boolean,
+): Promise<{ error: string; statusCode: number } | { teamId: string }> {
+  const [client, type] = await Promise.all([
+    serviceClient.from("clients").select("archived_at, team_id, teams(is_active)").eq("id", input.clientId).maybeSingle(),
     serviceClient.from("engagement_types").select("is_active").eq("id", input.engagementTypeId).maybeSingle(),
-    serviceClient.from("teams").select("id, is_active").eq("id", input.teamId).maybeSingle(),
   ]);
-  if (client.error || type.error || team.error) {
-    console.error("referencesError:", client.error?.message ?? type.error?.message ?? team.error?.message);
-    return { error: "Unable to check the engagement's client, type and team.", statusCode: 500 };
+  if (client.error || type.error) {
+    console.error("referencesError:", client.error?.message ?? type.error?.message);
+    return { error: "Unable to check the engagement's client and type.", statusCode: 500 };
   }
   if (!client.data) return { error: "Client not found.", statusCode: 404 };
   if (client.data.archived_at) return { error: "Restore the client before adding or changing its engagements.", statusCode: 400 };
   if (!type.data) return { error: "That engagement type does not exist.", statusCode: 400 };
   if (!type.data.is_active) return { error: "That engagement type is no longer in use.", statusCode: 400 };
-  if (!team.data) return { error: "That team does not exist.", statusCode: 400 };
-  if (team.data.is_active === false) return { error: "That team is inactive. Pick an active team.", statusCode: 400 };
-  return null;
+  if (creating && (client.data.teams as { is_active?: unknown } | null)?.is_active === false) {
+    return { error: "That client's team is inactive.", statusCode: 400 };
+  }
+  return { teamId: String(client.data.team_id) };
+}
+
+/** Why the caller can't use this client or engagement, or null. */
+async function placeError(ctx: EngagementContext, kind: "client" | "engagement", id: string, intent: "read" | "write") {
+  try {
+    return placeRefusal(await placeFor(ctx.serviceClient, ctx.callerId, kind, id), intent, kind);
+  } catch (error) {
+    console.error("engagement access:", (error as { message?: string }).message ?? error);
+    return { status: 500, error: `Unable to read the ${kind}.` };
+  }
 }
 
 /** Why this type can't be used by this team, or null. Nothing listed for a
@@ -130,7 +146,6 @@ function fieldsFrom(payload: Record<string, unknown>) {
   return {
     engagementName: text("engagementName"),
     engagementTypeId: text("engagementTypeId"),
-    teamId: text("teamId"),
     startDate: text("startDate"),
     endDate: text("endDate"),
     countryCode: text("countryCode").toUpperCase(),
@@ -149,17 +164,19 @@ async function handleListEngagements(ctx: EngagementContext, request: Request, u
   if (clientId && !isUuid(clientId)) {
     return jsonResponse({ error: "Invalid clientId." }, request, 400);
   }
+  const teamId = teamParam(url.searchParams);
+  if (teamId === false) return jsonResponse({ error: "Invalid teamId." }, request, 400);
   if (ctx.ownOnly && ctx.teams.teamIds.length === 0) {
     return jsonResponse({ engagements: [] }, request);
   }
 
   // Paged: the whole book can pass PostgREST's 1,000-row cap.
   const { data: engagements, error } = await selectAllRows(() => {
-    let query = serviceClient
-      .from("engagements")
-      .select(
-        "id, client_id, name, status, start_date, end_date, country_code, reference, description, created_at, created_by, engagement_type_id, team_id, engagement_types!inner(name), teams!inner(name), clients!inner(archived_at), our_entity_id, client_entity_id, our:legal_entities!engagements_our_entity_id_fkey(registered_name), theirs:legal_entities!engagements_client_entity_id_fkey(registered_name)",
-      )
+    let query = engagementsFor(
+      serviceClient,
+      ctx.callerId,
+      "id, client_id, name, status, start_date, end_date, country_code, reference, description, created_at, created_by, engagement_type_id, team_id, restricted, engagement_types!inner(name), teams!inner(name), clients!inner(archived_at), our_entity_id, client_entity_id, our:legal_entities!engagements_our_entity_id_fkey(registered_name), theirs:legal_entities!engagements_client_entity_id_fkey(registered_name)",
+    )
       // Archived engagements are history, never listed.
       .is("archived_at", null);
     // One client's engagements show even when it's archived (browsing it); the
@@ -167,6 +184,7 @@ async function handleListEngagements(ctx: EngagementContext, request: Request, u
     if (clientId) query = query.eq("client_id", clientId);
     else query = query.is("clients.archived_at", null);
     if (ctx.ownOnly) query = query.in("team_id", [...ctx.teams.teamIds]);
+    if (teamId) query = query.eq("team_id", teamId);
     return query.order("start_date", { ascending: false }).order("id");
   });
 
@@ -193,6 +211,7 @@ async function handleListEngagements(ctx: EngagementContext, request: Request, u
       engagementTypeName: str((e.engagement_types as { name?: unknown } | null)?.name),
       teamId: str(e.team_id),
       teamName: str((e.teams as { name?: unknown } | null)?.name),
+      restricted: e.restricted === true,
       // Null: the team's default (ours) and the client's default (theirs).
       ourEntityId: typeof e.our_entity_id === "string" ? e.our_entity_id : null,
       ourEntityName: str((e.our as { registered_name?: unknown } | null)?.registered_name),
@@ -224,25 +243,30 @@ async function handleCreateEngagement(
     return jsonResponse({ error: "Invalid engagement status." }, request, 400);
   }
 
-  if (!clientId || !fields.engagementName || !fields.engagementTypeId || !fields.teamId || !fields.startDate || !fields.endDate) {
+  if (!clientId || !fields.engagementName || !fields.engagementTypeId || !fields.startDate || !fields.endDate) {
     return jsonResponse(
-      { error: "clientId, engagementName, engagementTypeId, teamId, startDate, and endDate are required." },
+      { error: "clientId, engagementName, engagementTypeId, startDate, and endDate are required." },
       request,
       400,
     );
   }
-  if (!isUuid(clientId) || !isUuid(fields.engagementTypeId) || !isUuid(fields.teamId)) {
-    return jsonResponse({ error: "Invalid clientId, engagementTypeId or teamId." }, request, 400);
+  if (!isUuid(clientId) || !isUuid(fields.engagementTypeId)) {
+    return jsonResponse({ error: "Invalid clientId or engagementTypeId." }, request, 400);
   }
 
   // The shared rules, same as update.
   const inputError = engagementInputError(fields);
   if (inputError) return jsonResponse({ error: inputError }, request, 400);
-  const teamError = engagementWriteError(ctx.teams, fields.teamId);
-  if (teamError) return jsonResponse({ error: teamError }, request, 403);
-  const refError = await referencesError(serviceClient, { clientId, ...fields });
-  if (refError) return jsonResponse({ error: refError.error }, request, refError.statusCode);
-  const offerError = await typeOfferError(serviceClient, fields.engagementTypeId, fields.teamId);
+  // Adding an engagement changes its client, so it needs Can edit there.
+  const refused = await placeError(ctx, "client", clientId, "write");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
+  const refs = await referencesError(serviceClient, { clientId, ...fields }, true);
+  if ("error" in refs) return jsonResponse({ error: refs.error }, request, refs.statusCode);
+  // At Own, an engagement is one of your teams'.
+  if (ctx.ownOnly && !ctx.teams.teamIds.includes(refs.teamId)) {
+    return jsonResponse({ error: "That client is not one of your teams'." }, request, 403);
+  }
+  const offerError = await typeOfferError(serviceClient, fields.engagementTypeId, refs.teamId);
   if (offerError) return jsonResponse({ error: offerError }, request, 400);
   const entityError = await entityChoiceError(serviceClient, clientId, fields);
   if (entityError) return jsonResponse({ error: entityError }, request, 400);
@@ -256,7 +280,8 @@ async function handleCreateEngagement(
     .insert({
       organisation_id: org.id,
       client_id: clientId,
-      team_id: fields.teamId,
+      // The trigger sets it from the client anyway.
+      team_id: refs.teamId,
       engagement_type_id: fields.engagementTypeId,
       name: fields.engagementName,
       status,
@@ -272,12 +297,14 @@ async function handleCreateEngagement(
     .select("id")
     .single();
 
+  const duplicate = duplicateNameError(error);
+  if (duplicate) return jsonResponse({ error: duplicate }, request, 409);
   if (error) {
     return internalError(request, error);
   }
   if (typeof createdEngagement?.id === "string") {
     await applyFolderTemplate(serviceClient, "engagement", createdEngagement.id, callerId, {
-      teamId: fields.teamId,
+      teamId: refs.teamId,
       engagementTypeId: fields.engagementTypeId,
     });
   }
@@ -287,6 +314,7 @@ async function handleCreateEngagement(
     // Return the new id so the client doesn't have to re-list to find what it
     // just created.
     engagementId: typeof createdEngagement?.id === "string" ? createdEngagement.id : null,
+    teamId: refs.teamId,
   }, request);
 }
 
@@ -302,15 +330,15 @@ async function handleUpdateEngagement(
   fields.countryCode = effectiveCountry(fields.countryCode, await loadOrgLocale(serviceClient));
   const status = normalizeEngagementStatus(payload.status);
 
-  if (!engagementId || !fields.engagementName || !fields.engagementTypeId || !fields.teamId || !fields.startDate || !fields.endDate) {
+  if (!engagementId || !fields.engagementName || !fields.engagementTypeId || !fields.startDate || !fields.endDate) {
     return jsonResponse(
-      { error: "engagementId, engagementName, engagementTypeId, teamId, startDate, and endDate are required." },
+      { error: "engagementId, engagementName, engagementTypeId, startDate, and endDate are required." },
       request,
       400,
     );
   }
-  if (!isUuid(engagementId) || !isUuid(fields.engagementTypeId) || !isUuid(fields.teamId)) {
-    return jsonResponse({ error: "Invalid engagementId, engagementTypeId or teamId." }, request, 400);
+  if (!isUuid(engagementId) || !isUuid(fields.engagementTypeId)) {
+    return jsonResponse({ error: "Invalid engagementId or engagementTypeId." }, request, 400);
   }
   if (payload.status !== undefined && status === null) {
     return jsonResponse({ error: "Invalid engagement status." }, request, 400);
@@ -323,16 +351,15 @@ async function handleUpdateEngagement(
   if ("error" in existing) return jsonResponse({ error: existing.error }, request, existing.statusCode);
   if (existing.isArchived) return jsonResponse({ error: "Cannot modify an archived engagement." }, request, 400);
 
-  // The owning team changes it; moving it needs membership of both teams.
-  const teamError = engagementWriteError(ctx.teams, existing.teamId) ?? engagementWriteError(ctx.teams, fields.teamId);
-  if (teamError) return jsonResponse({ error: teamError }, request, 403);
-  const refError = await referencesError(serviceClient, { clientId: existing.clientId, ...fields });
-  if (refError) return jsonResponse({ error: refError.error }, request, refError.statusCode);
+  const refused = await placeError(ctx, "engagement", engagementId, "write");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
+  const refs = await referencesError(serviceClient, { clientId: existing.clientId, ...fields }, false);
+  if ("error" in refs) return jsonResponse({ error: refs.error }, request, refs.statusCode);
   const { data: chosen } = await serviceClient
     .from("engagements").select("our_entity_id, client_entity_id, engagement_type_id").eq("id", engagementId).maybeSingle();
-  // The type it already has stays allowed; a new type or team is held to the business unit's list.
-  if (chosen?.engagement_type_id !== fields.engagementTypeId || existing.teamId !== fields.teamId) {
-    const offerError = await typeOfferError(serviceClient, fields.engagementTypeId, fields.teamId);
+  // The type it already has stays allowed; a new type is held to the business unit's list.
+  if (chosen?.engagement_type_id !== fields.engagementTypeId) {
+    const offerError = await typeOfferError(serviceClient, fields.engagementTypeId, existing.teamId);
     if (offerError) return jsonResponse({ error: offerError }, request, 400);
   }
   const entityError = await entityChoiceError(serviceClient, existing.clientId, fields, {
@@ -344,7 +371,6 @@ async function handleUpdateEngagement(
   const updatePayload: Record<string, unknown> = {
     name: fields.engagementName,
     engagement_type_id: fields.engagementTypeId,
-    team_id: fields.teamId,
     start_date: fields.startDate,
     end_date: fields.endDate,
     country_code: fields.countryCode,
@@ -358,6 +384,8 @@ async function handleUpdateEngagement(
   if (status !== null) updatePayload.status = status;
 
   const { error } = await serviceClient.from("engagements").update(updatePayload).eq("id", engagementId);
+  const duplicate = duplicateNameError(error);
+  if (duplicate) return jsonResponse({ error: duplicate }, request, 409);
   if (error) {
     return internalError(request, error);
   }
@@ -376,6 +404,8 @@ async function handleDeleteEngagement(
     return jsonResponse({ error: "Invalid engagementId." }, request, 400);
   }
 
+  const refused = await placeError(ctx, "engagement", engagementId, "read");
+  if (refused) return jsonResponse({ error: refused.error }, request, refused.status);
   const existing = await getEngagement(ctx.serviceClient, engagementId);
   if ("error" in existing) return jsonResponse({ error: existing.error }, request, existing.statusCode);
   if (existing.isArchived) return jsonResponse({ error: "Engagement is already archived." }, request, 400);
@@ -407,6 +437,8 @@ function engagementDocumentConfig(ctx: EngagementContext): DocumentEntityConfig 
     record: "engagement",
     checkAccess: async (engagementId, intent) => {
       if (!isUuid(engagementId)) return { error: "Invalid engagementId.", status: 400 };
+      const refused = await placeError(ctx, "engagement", engagementId, intent);
+      if (refused) return refused;
       const engagement = await getEngagement(ctx.serviceClient, engagementId);
       if ("error" in engagement) return { error: engagement.error, status: engagement.statusCode };
       // At Own, an engagement's files follow the engagement: a team of yours.
@@ -416,8 +448,6 @@ function engagementDocumentConfig(ctx: EngagementContext): DocumentEntityConfig 
       if (intent === "write") {
         if (engagement.isArchived) return { error: "Cannot modify an archived engagement.", status: 400 };
         if (engagement.clientArchived) return { error: "Restore the client before changing its files.", status: 400 };
-        const teamError = engagementWriteError(ctx.teams, engagement.teamId);
-        if (teamError) return { error: teamError, status: 403 };
       }
       return null;
     },

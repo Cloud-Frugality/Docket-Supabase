@@ -1,7 +1,7 @@
 // Which business units an engagement type is offered to, and which engagement
 // types and business units a document category is offered to. One rule
 // throughout: nothing listed means everyone. Pure, so the tests run this
-// file; mirrored in src/lib/list-links.ts.
+// file; mirrored in the Windows app.
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

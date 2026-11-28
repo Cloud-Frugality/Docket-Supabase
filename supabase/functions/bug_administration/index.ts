@@ -12,8 +12,8 @@ import {
 import { requirePermission } from "../_shared/permissions.ts";
 import type { ServiceClient } from "../_shared/service-client.ts";
 
-// Fixed vocabularies live in _shared/vocabularies.ts, drift-tested against
-// src/lib/constants.ts.
+// Fixed vocabularies live in _shared/vocabularies.ts, kept in step with
+// the Windows app.
 
 const SCREENSHOT_BUCKET = "bug-screenshots";
 // Decoded bytes. Screenshots are usually well under this; it stops a huge

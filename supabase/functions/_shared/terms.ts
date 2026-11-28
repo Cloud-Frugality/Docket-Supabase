@@ -1,5 +1,5 @@
 // The organisation's own words for a client and an engagement. Pure, so the
-// tests run this file. Mirrored for the screens in src/lib/terms.ts.
+// tests run this file. Mirrored for the screens in the Windows app.
 
 export const TERM_KEYS = ["client", "clients", "engagement", "engagements"] as const;
 export type TermKey = (typeof TERM_KEYS)[number];

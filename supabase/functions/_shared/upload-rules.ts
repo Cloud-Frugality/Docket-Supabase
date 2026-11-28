@@ -1,6 +1,6 @@
 // What may be uploaded: the kinds of file the organisation allows and how big
 // one may be. Import-free so the tests run this file; the client mirrors the
-// list in src/lib/upload-rules.ts (drift-tested).
+// list in the Windows app.
 //
 // A global admin picks from the kinds below and sets the size, up to the
 // ceiling. The storage buckets are set to the same limits when it is saved,

@@ -21,8 +21,8 @@ import {
   handleUpdateDocument,
 } from "../_shared/document-handlers.ts";
 
-// Fixed vocabularies live in _shared/vocabularies.ts, drift-tested against
-// src/lib/constants.ts. The area list is shared with bugs so both boards read
+// Fixed vocabularies live in _shared/vocabularies.ts, kept in step with
+// the Windows app. The area list is shared with bugs so both boards read
 // the same.
 
 // The board needs a short heading; take the description's first

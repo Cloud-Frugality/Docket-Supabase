@@ -11,8 +11,8 @@ import { MAX_NAME, isUuid, overMaxLength } from "../_shared/validation.ts";
 import { requirePermission } from "../_shared/permissions.ts";
 import { loadOrgLocale } from "../_shared/organisation-locale.ts";
 
-// The RBAC vocabulary lives in _shared/vocabularies.ts, drift-tested against
-// src/lib/constants.ts.
+// The RBAC vocabulary lives in _shared/vocabularies.ts, kept in step with
+// the Windows app.
 const READONLY_ENTITIES = new Set<string>(ACCESS_READONLY_ENTITIES);
 const NO_OWN_ENTITIES = new Set<string>(ACCESS_NO_OWN_ENTITIES);
 
@@ -22,7 +22,7 @@ function scopeFor(entity: string, value: number): number {
   return NO_OWN_ENTITIES.has(entity) && value === 1 ? 2 : value;
 }
 
-// LANDING_ENTITY also comes from _shared/vocabularies.ts, drift-tested against
+// LANDING_ENTITY also comes from _shared/vocabularies.ts, kept in step with
 // LANDING_PAGES client-side.
 
 // Keep a landing path only if it's known and the role can read its entity;

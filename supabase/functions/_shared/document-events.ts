@@ -1,5 +1,5 @@
 // What a file's history records. No database here; the client mirrors the
-// labels in src/lib/document-types.ts (drift-tested).
+// labels in the Windows app.
 
 export const DOCUMENT_EVENTS = [
   "uploaded",
